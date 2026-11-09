@@ -9,6 +9,8 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
     public bool All { get; init; }
     public string[] Namespaces { get; init; } = [];
     public string[]? Assemblies { get; init; }
+    /// <summary>排除指定的程序集列表，以逗号分隔，例如 --exclude-assemblies Sirius.dll,Sirius.Shared.dll</summary>
+    public string[]? ExcludeAssemblies { get; init; }
     public string? Methods { get; init; }
     /// <summary>顶层类型全名清单（每行一个，取制表符前的第一列）；选择这些类型及其嵌套类型的全部方法。</summary>
     public string? Types { get; init; }
@@ -22,8 +24,12 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
     /// 用来得到结构完整的工程；排查问题时不要开，崩溃的堆栈只留下第一行。
     /// </summary>
     public bool KeepGoing { get; init; }
-    /// <summary>--keep-going 时单个方法的恢复时限。</summary>
-    public int MethodTimeoutSeconds { get; init; } = 600;
+    /// <summary>单个方法的恢复时限（秒），超时自动跳过该方法，默认 30 秒。</summary>
+    public int MethodTimeoutSeconds { get; init; } = 30;
+    /// <summary>恢复过程进程内存占用上限（MB），默认 8192 MB。接近阈值主动 GC，超过上限跳过方法以避免 OOM 崩溃。</summary>
+    public long MaxMemoryMB { get; init; } = 8192;
+    /// <summary>若输出目录非空，清空并覆盖。</summary>
+    public bool Overwrite { get; init; }
     public string SourceLayout { get; init; } = "flat";
 
     public bool HasScope => (All ? 1 : 0) + (Namespaces.Length > 0 ? 1 : 0)
@@ -36,6 +42,7 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
         if (Jobs < 1) throw new ArgumentException("--jobs 必须大于零");
         if (Limit < 1) throw new ArgumentException("--limit 必须大于零");
         if (MethodTimeoutSeconds < 1) throw new ArgumentException("--method-timeout 必须大于零");
+        if (MaxMemoryMB < 0) throw new ArgumentException("--max-memory-mb 不能为负数");
         if (SourceLayout is not ("flat" or "project")) throw new ArgumentException("--source-layout 必须是 flat 或 project");
     }
 
@@ -50,6 +57,7 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
             if (option == "--no-source") { request = request with { NoSource = true }; continue; }
             if (option == "--stubs-only") { request = request with { StubsOnly = true }; continue; }
             if (option == "--keep-going") { request = request with { KeepGoing = true }; continue; }
+            if (option is "--overwrite" or "--clean") { request = request with { Overwrite = true }; continue; }
             if (++i == options.Length) throw new ArgumentException($"{option} 缺少参数");
             var value = options[i];
             if (option is "--namespaces" or "--assemblies" or "--methods" or "--types") scopes++;
@@ -58,13 +66,15 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
                 "--profile" => request with { Profile = value },
                 "--fact-cache-file" => request with { Options = request.Options with { FactCacheFile = Path.GetFullPath(value) } },
                 "--namespaces" => request with { Namespaces = Split(value) },
-                "--assemblies" => request with { Assemblies = Split(value) },
+                "--assemblies" => request with { Assemblies = SplitAssemblies(value) },
+                "--exclude-assemblies" or "--exclude" => request with { ExcludeAssemblies = SplitAssemblies(value) },
                 "--methods" => request with { Methods = value },
                 "--types" => request with { Types = value },
                 "--limit" => request with { Limit = int.Parse(value) },
                 "--jobs" => request with { Jobs = int.Parse(value) },
                 "--source-layout" => request with { SourceLayout = value },
                 "--method-timeout" => request with { MethodTimeoutSeconds = int.Parse(value) },
+                "--max-memory-mb" or "--max-memory" => request with { MaxMemoryMB = long.Parse(value) },
                 _ => throw new ArgumentException($"未知参数 {option}"),
             };
         }
@@ -75,6 +85,9 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
     /// <summary>类型清单中的顶层类型全名。</summary>
     public HashSet<string>? TypeNames() => Types is null ? null
         : File.ReadLines(Types).Where(l => l.Length > 0 && !l.StartsWith('#')).Select(l => l.Split('\t')[0].Trim()).ToHashSet(StringComparer.Ordinal);
+
+    private static string[] SplitAssemblies(string value) =>
+        Split(value).Select(a => a.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? a : a + ".dll").ToArray();
 
     private static string[] Split(string value) => value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 }

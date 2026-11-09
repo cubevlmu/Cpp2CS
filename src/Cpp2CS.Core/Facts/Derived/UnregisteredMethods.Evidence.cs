@@ -43,14 +43,23 @@ public static partial class UnregisteredInference
             var functions = facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed && facts.EntriesAt(f.Start).Length == 0).ToDictionary(f => f.Start);
             var sites = facts.Scan.All.Where(r => r.Kind is RefKind.Call or RefKind.TailCall && functions.ContainsKey(r.Target))
                 .Select(r => new Observation(facts.Code.At(r.Site)!.Start, r)).ToArray();
+            log?.Invoke($"[Facts][Unregistered] 找到 {functions.Count} 个未注册托管函数，收集到 {sites.Length} 个调用点");
             Observe(sites);
             // 整个注册集合参与歧义否决；不能先按 A 的定义过滤再宣布 B 唯一。
             var shapes = RegisteredShapes();
             var conflicts = new List<string>();
             var abiProblems = new List<string>();
             var contradictions = new List<string>();
-            foreach (var group in sites.GroupBy(s => s.Reference.Target).OrderBy(g => g.Key))
+            var targetGroups = sites.GroupBy(s => s.Reference.Target).OrderBy(g => g.Key).ToArray();
+            log?.Invoke($"[Facts][Unregistered] 正在推断 {targetGroups.Length} 个目标未注册函数的身份与 ABI 签名...");
+            var targetIdx = 0;
+            foreach (var group in targetGroups)
             {
+                targetIdx++;
+                if (targetIdx % 200 == 0 || targetIdx == targetGroups.Length)
+                {
+                    log?.Invoke($"[Facts][Unregistered] 目标函数推断进度: {targetIdx}/{targetGroups.Length} ({targetIdx * 100.0 / targetGroups.Length:F1}%)");
+                }
                 var observations = group.ToArray();
                 var positive = observations.SelectMany(s => s.Positive).Distinct().ToArray();
                 var complete = positive.Where(IsComplete).ToArray();
@@ -105,7 +114,7 @@ public static partial class UnregisteredInference
             facts.Checks.Add("unregistered.analysis", "Warning", sites.Length, analysisErrors, "调用者提升/L2 不完整，相关目标不接受");
             facts.Checks.Add("unregistered.registration", "Error", functions.Count, contradictions, "A 与注册调整器精确跳转的定义矛盾");
             facts.Checks.Info("unregistered.definitions", result.All.Count, string.Join("；", result.Decisions.GroupBy(d => d.Reason).OrderBy(g => g.Key).Select(g => $"{g.Key}={g.Count()}")));
-            log?.Invoke($"未注册定义：{result.All.Count}/{functions.Count}；原始调用点 {sites.Length}");
+            log?.Invoke($"[Facts][Unregistered] 未注册定义推断完成：接受 {result.All.Count}/{functions.Count}，原始调用点 {sites.Length}");
             return result;
         }
 
@@ -122,8 +131,16 @@ public static partial class UnregisteredInference
         {
             var lifter = new FunctionLifter(facts);
             var rewriter = new IdiomRewriter(facts) { RecordFilter = _ => false };
-            foreach (var group in sites.GroupBy(s => s.Caller))
+            var callerGroups = sites.GroupBy(s => s.Caller).ToArray();
+            log?.Invoke($"[Facts][Unregistered] 正在分析 {callerGroups.Length} 个调用者位置的机器码与参数寄存器...");
+            var callerIdx = 0;
+            foreach (var group in callerGroups)
             {
+                callerIdx++;
+                if (callerIdx % 200 == 0 || callerIdx == callerGroups.Length)
+                {
+                    log?.Invoke($"[Facts][Unregistered] 调用者分析进度: {callerIdx}/{callerGroups.Length} ({callerIdx * 100.0 / callerGroups.Length:F1}%)");
+                }
                 var lifted = lifter.Lift(group.Key);
                 var rewritten = lifted.Succeeded ? rewriter.Run(lifted.Function) : null;
                 if (!lifted.Succeeded || rewritten!.Errors.Count > 0)
@@ -141,7 +158,7 @@ public static partial class UnregisteredInference
                 var calls = statements.OfType<Call>().ToLookup(c => c.Address);
                 foreach (var site in group)
                 {
-                    var call = calls[site.Reference.Site].SingleOrDefault(c => c.Target is Const target && target.Value == site.Reference.Target);
+                    var call = calls[site.Reference.Site].FirstOrDefault(c => c.Target is Const target && target.Value == site.Reference.Target);
                     if (call is null) continue;
                     for (var i = 0; i < call.Arguments.Length; i++)
                     {
@@ -154,7 +171,7 @@ public static partial class UnregisteredInference
                     }
                 }
             }
-            log?.Invoke($"未注册定义 A 普查完成：{sites.Select(s => s.Caller).Distinct().Count()} 调用者");
+            log?.Invoke($"[Facts][Unregistered] 调用者普查完成：共处理 {callerGroups.Length} 个调用者");
         }
 
         private static Expr Expand(Expr value, Dictionary<Variable, Expr> definitions, HashSet<Variable> path) =>

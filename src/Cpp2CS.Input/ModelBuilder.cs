@@ -58,11 +58,14 @@ namespace Cpp2CS.Input
             types = new TypeDef[metadata.typeDefs.Length];
         }
 
-        public static (ProgramModel Model, ModelBuilder Builder) Load(string binaryPath, string metadataPath)
+        public static (ProgramModel Model, ModelBuilder Builder) Load(string binaryPath, string metadataPath, Action<string>? log = null)
         {
+            log?.Invoke($"[Facts][Model] 正在读取二进制文件: {Path.GetFileName(binaryPath)}...");
             var image = ImageDocument.Load(binaryPath);
+            log?.Invoke($"[Facts][Model] 正在读取元数据文件: {Path.GetFileName(metadataPath)}...");
             var metadata = new Metadata(new MemoryStream(File.ReadAllBytes(metadataPath)));
             var bytes = File.ReadAllBytes(binaryPath);
+            log?.Invoke($"[Facts][Model] 目标架构: {image.Architecture}，元数据版本: {metadata.Version}");
             Il2Cpp il2Cpp = image.Architecture switch
             {
                 Cpp2CS.Model.Architecture.Arm64 => new Elf64(new MemoryStream(bytes)),
@@ -70,10 +73,14 @@ namespace Cpp2CS.Input
                 _ => throw new NotSupportedException(image.Architecture.ToString()),
             };
             il2Cpp.SetProperties(metadata.Version, metadata.metadataUsagesCount);
-            var (codeRegistration, metadataRegistration) = FindRegistration(il2Cpp, metadata, binaryPath);
+            log?.Invoke($"[Facts][Model] 正在检索注册表 CodeRegistration 与 MetadataRegistration 地址...");
+            var (codeRegistration, metadataRegistration) = FindRegistration(il2Cpp, metadata, binaryPath, log);
             if (il2Cpp.IsDumped) throw new NotSupportedException("只支持磁盘映像，不支持内存转储");
+            log?.Invoke($"[Facts][Model] 注册表已就绪: Code=0x{codeRegistration:x}, Meta=0x{metadataRegistration:x}，开始构建程序模型拓扑...");
             var builder = new ModelBuilder(metadata, il2Cpp, image) { CodeRegistration = codeRegistration, MetadataRegistration = metadataRegistration };
-            return (builder.Build(il2Cpp.MapVATR<Il2CppMetadataRegistration>(metadataRegistration)), builder);
+            var model = builder.Build(il2Cpp.MapVATR<Il2CppMetadataRegistration>(metadataRegistration));
+            log?.Invoke($"[Facts][Model] 模型拓扑就绪: 共包含 {model.Assemblies.Count} 个程序集，{model.Types.Count} 个类型，{model.Methods.Count} 个方法");
+            return (model, builder);
         }
 
         /// <summary>
@@ -82,7 +89,7 @@ namespace Cpp2CS.Input
         /// 这里从输出取回，连同最终版本号按 文件名+大小+修改时间 缓存在工作目录的 .cpp2cs/registration，之后直接以缓存值调用 Init。
         /// 以最终版本号重放 Init 与原过程等价：Init 内只有从旧版本号出发的修正分支。
         /// </summary>
-        private static (ulong Code, ulong Metadata) FindRegistration(Il2Cpp il2Cpp, Metadata metadata, string binaryPath)
+        private static (ulong Code, ulong Metadata) FindRegistration(Il2Cpp il2Cpp, Metadata metadata, string binaryPath, Action<string>? log = null)
         {
             var invariant = System.Globalization.CultureInfo.InvariantCulture;
             var file = new FileInfo(binaryPath);
@@ -93,9 +100,11 @@ namespace Cpp2CS.Input
                 il2Cpp.Version = double.Parse(parts[0], invariant);
                 var cachedMeta = System.Convert.ToUInt64(parts[2], 16);
                 var cachedCode = System.Convert.ToUInt64(parts[1], 16);
+                log?.Invoke($"[Facts][Model] 命中注册表缓存 ({cache})");
                 il2Cpp.Init(cachedCode, cachedMeta);
                 return (cachedCode, cachedMeta);
             }
+            log?.Invoke($"[Facts][Model] 未命中缓存，开始执行 PlusSearch 自动搜索注册表 (较大映像可能需要数十秒)...");
             var console = Console.Out;
             var captured = new StringWriter();
             Console.SetOut(captured);
@@ -108,6 +117,7 @@ namespace Cpp2CS.Input
             var meta = Printed("MetadataRegistration : ");
             Directory.CreateDirectory(Path.GetDirectoryName(cache)!);
             File.WriteAllText(cache, $"{il2Cpp.Version.ToString(invariant)} {code:x} {meta:x}");
+            log?.Invoke($"[Facts][Model] PlusSearch 搜索成功，已缓存至 {cache}");
             return (code, meta);
         }
 

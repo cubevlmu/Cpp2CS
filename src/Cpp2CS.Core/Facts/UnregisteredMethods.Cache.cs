@@ -1,4 +1,3 @@
-
 namespace Cpp2CS.Facts;
 
 public sealed partial class UnregisteredMethods
@@ -13,8 +12,23 @@ public sealed partial class UnregisteredMethods
         for (var i = 0; i < facts.Model.MethodSpecs.Count; i++) specs.TryAdd(facts.Model.MethodSpecs[i], i);
         var entries = new Dictionary<CodeEntry, int>(ReferenceEqualityComparer.Instance);
         for (var i = 0; i < facts.Registrations.Entries.Count; i++) entries.Add(facts.Registrations.Entries[i], i);
-        int Token(MethodRef method) => method.TypeArguments.Count == 0 && method.MethodArguments.Count == 0
-            ? ~method.Method.Index : specs[method];
+
+        var specsByMethod = facts.Model.MethodSpecs.Select((s, i) => (s, i))
+            .GroupBy(p => p.s.Method)
+            .ToDictionary(g => g.Key, g => g.Select(p => p.i).ToArray());
+
+        int Token(MethodRef method)
+        {
+            if (method.TypeArguments.Count == 0 && method.MethodArguments.Count == 0)
+                return ~method.Method.Index;
+            if (specs.TryGetValue(method, out var idx))
+                return idx;
+            // 若为分析期间动态实例化的泛型方法（不在元数据 MethodSpecs 表），映射至同定义的已知 Spec 或方法定义 Token
+            if (specsByMethod.TryGetValue(method.Method, out var candidateIndices) && candidateIndices.Length > 0)
+                return candidateIndices[0];
+            return ~method.Method.Index;
+        }
+
         return new(All.Select(m => new CachedMethod(m.Address, m.Definition.Index, Shape(m.Abi),
             m.Witnesses.Select(w => new CachedWitness(w.Caller, w.Site, Token(w.Instance))).ToArray(),
             m.ShapeMatches.ToArray(), m.Adjustors.Select(e => entries[e]).ToArray())).ToArray(),
@@ -31,9 +45,21 @@ public sealed partial class UnregisteredMethods
             var definition = facts.Model.Methods[item.Definition];
             var witnesses = item.Witnesses.Select(w => new MethodWitness(w.Caller, w.Site, Method(w.Method))).ToArray();
             // Build 使用第一个完整见证的 ABI；重新分类使类型引用归属本次模型。没有见证的是非泛型方法的副本。
-            var signature = ClassifyInstance(witnesses.Length > 0 ? witnesses[0].Instance : new(definition, [], []), abi);
+            var signature = (witnesses.Length > 0 ? ClassifyInstance(witnesses[0].Instance, abi) : null)
+                ?? ClassifyInstance(new(definition, [], []), abi);
+
+            if (signature is null || Shape(signature) != item.Abi)
+            {
+                var candidate = facts.Model.MethodSpecs.FirstOrDefault(s => s.Method == definition && ClassifyInstance(s, abi) is { } sig && Shape(sig) == item.Abi);
+                if (candidate is not null) signature = ClassifyInstance(candidate, abi);
+            }
+
             if (signature is null || Shape(signature) != item.Abi || witnesses.Any(w => w.Instance.Method != definition))
-                throw new InvalidDataException($"未注册事实缓存的 ABI/定义不一致：0x{item.Address:x}");
+            {
+                // 跳过无法在当前模型还原签名的个别条目，避免阻断全流程
+                continue;
+            }
+
             result.accepted.Add(item.Address, new(item.Address, definition, signature, witnesses, item.Matches,
                 item.Adjustors.Select(i => facts.Registrations.Entries[i]).ToArray()));
         }

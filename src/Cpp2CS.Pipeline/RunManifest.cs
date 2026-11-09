@@ -24,7 +24,16 @@ internal sealed class RunManifest
     {
         this.request = request;
         if (Directory.Exists(request.Output) && Directory.EnumerateFileSystemEntries(request.Output).Any())
-            throw new IOException($"输出目录非空，不能把不同运行的产物混合：{request.Output}");
+        {
+            if (request.Overwrite)
+            {
+                Directory.Delete(request.Output, true);
+            }
+            else
+            {
+                throw new IOException($"输出目录非空，不能把不同运行的产物混合：{request.Output}。若需覆盖已存在目录，请指定 --overwrite");
+            }
+        }
         Directory.CreateDirectory(request.Output);
         path = Path.Combine(request.Output, "run.json");
         inputs["binary"] = Hash(request.Binary);

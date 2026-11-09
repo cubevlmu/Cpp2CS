@@ -7,7 +7,7 @@ namespace Cpp2CS.Output;
 public static class SourceProject
 {
     public static int Write(string assemblyPath, string searchDirectory, string output,
-        Func<ICSharpCode.Decompiler.TypeSystem.ITypeDefinition, bool> include, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null)
+        Func<ICSharpCode.Decompiler.TypeSystem.ITypeDefinition, bool> include, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null, Action<string>? log = null)
     {
         using var module = ModuleDefinition.ReadModule(assemblyPath);
         var directory = Path.Combine(output, FileName(Path.GetFileName(assemblyPath)));
@@ -23,7 +23,11 @@ public static class SourceProject
             var path = Path.Combine(directory, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, source.Source);
-            if (source.TypeName is not null) count++;
+            if (source.TypeName is not null)
+            {
+                count++;
+                log?.Invoke($"[阶段 6/6: Decompile] [#{count}] 正在生成类型源码: {source.TypeName}");
+            }
         }
         if (StrippedAttributes(searchDirectory) is { Length: > 0 } stripped)
         {

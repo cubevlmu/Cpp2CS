@@ -12,8 +12,14 @@ internal static class RecoverCommand
             Console.Error.WriteLine("必须且只能指定一种恢复范围：--all、--assemblies、--namespaces、--methods 或 --types。");
             return 2;
         }
-        var result = RecoverySession.Run(request, Console.Error.WriteLine);
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        var result = RecoverySession.Run(request, msg =>
+        {
+            Console.WriteLine(msg);
+            Console.Out.Flush();
+        });
         Console.Write(result.Report);
+        Console.Out.Flush();
         return 0;
     }
 }

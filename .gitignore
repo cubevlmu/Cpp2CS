@@ -5,6 +5,7 @@ artifacts/
 *.suo
 .vs/
 .cpp2cs/
+.codegraph/
 tests/**/Recovered.cs
 **/__pycache__/
 *.local.*

@@ -17,14 +17,17 @@ namespace Cpp2CS.Input
             var clock = Stopwatch.StartNew();
             T Step<T>(string name, Func<T> action)
             {
+                var curMem = GC.GetTotalMemory(false) / (1024 * 1024);
+                log?.Invoke($"[Facts] 开始步骤: {name} (托管内存: {curMem} MB)");
                 var start = clock.Elapsed.TotalSeconds;
                 var result = action();
                 timings[name] = Math.Round(clock.Elapsed.TotalSeconds - start, 3);
-                log?.Invoke($"{name}: {timings[name]:F1}s");
+                var endMem = GC.GetTotalMemory(false) / (1024 * 1024);
+                log?.Invoke($"[Facts] 完成步骤: {name}，耗时 {timings[name]:F1}s (托管内存: {endMem} MB)");
                 return result;
             }
 
-            var (model, builder) = Step("model", () => ModelBuilder.Load(binaryPath, metadataPath));
+            var (model, builder) = Step("model", () => ModelBuilder.Load(binaryPath, metadataPath, log));
             var map = Step("codemap", () => CodeMap.Build(model.Image));
             var scan = Step("scan", () => CodeScan.Run(map));
             var (registrations, problems) = Step("registrations", () => RegistrationReader.Read(model, builder.CodeRegistration, builder.MetadataRegistration));

@@ -5,11 +5,12 @@ namespace Cpp2CS.Output;
 public static class DependencyClosure
 {
     public static void Complete(IEnumerable<MethodRecoveryResult> roots, List<MethodRecoveryResult> dependencies,
-        Dictionary<MethodDef, MethodRecoveryResult> recovered, IMethodResults recovery)
+        Dictionary<MethodDef, MethodRecoveryResult> recovered, IMethodResults recovery, Action<string>? log = null)
     {
         var selected = roots.ToArray();
         var scheduled = selected.Select(r => r.Method.Method).ToHashSet();
         var pending = new Queue<MethodRecoveryResult>(selected);
+        var depIndex = 0;
         while (pending.TryDequeue(out var current))
         {
             if (current.Body is not { } body) continue;
@@ -17,6 +18,8 @@ public static class DependencyClosure
             foreach (var method in Required(body).Distinct().OrderBy(m => m.Index))
             {
                 if (!scheduled.Add(method)) continue;
+                depIndex++;
+                log?.Invoke($"[阶段 4/6: Dependencies] [#{depIndex}] 正在补齐依赖方法: 0x{method.Address:x} {method.Owner.FullName}.{method.Name}");
                 if (!recovered.TryGetValue(method, out var dependency))
                     recovered[method] = dependency = recovery.RecoverDefinition(method);
                 dependencies.Add(dependency);

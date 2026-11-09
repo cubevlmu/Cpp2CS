@@ -85,7 +85,9 @@ internal static class UnregisteredFactsCache
                 stream.Write(payload);
             }
             File.Move(temporary, path, overwrite: true);
-            log?.Invoke($"未注册事实缓存：已保存 {header.Length + payload.Length:N0} 字节");
+            var latest = Path.Combine(Path.GetDirectoryName(path)!, "latest.cache");
+            try { File.Copy(path, latest, overwrite: true); } catch { }
+            log?.Invoke($"[Facts][Cache] 未注册事实缓存：已成功持久化至 {path} ({header.Length + payload.Length:N0} 字节)");
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {

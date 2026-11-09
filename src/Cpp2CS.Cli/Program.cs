@@ -25,6 +25,7 @@ internal static class Program
             ["idioms", var binary, var metadata, var output, .. var options] => Idioms(binary, metadata, output, options),
             ["recover", var binary, var metadata, var output, .. var options] => RecoverCommand.Run(binary, metadata, output, options),
             ["inspect", var binary, var metadata, .. var options] when options.Length > 0 => Inspect.Run(binary, metadata, options),
+            ["assemblies", var binary, var metadata] => ListAssemblies(binary, metadata),
             ["source-project", var assembly, var output] => SourceProject(assembly, output),
             ["holes", var run, .. var options] => HoleCensus.Run(run, options),
             _ => Usage(),
@@ -56,6 +57,16 @@ internal static class Program
                                                                       将已有程序集按项目目录导出 C#，依赖从程序集所在目录解析。
             """);
         return 2;
+    }
+
+    private static int ListAssemblies(string binary, string metadata)
+    {
+        var (model, _) = ModelBuilder.Load(binary, metadata, null);
+        foreach (var a in model.Assemblies)
+        {
+            Console.WriteLine(a.Name);
+        }
+        return 0;
     }
 
     private static int SourceProject(string assembly, string output)
