@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Cpp2CS.X64.Cli</RootNamespace>
+    <AssemblyName>cpp2cs-x64</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Cpp2CS.X64/Cpp2CS.X64.csproj" />
+    <ProjectReference Include="../Cpp2CS.Input/Cpp2CS.Input.csproj" />
+    <ProjectReference Include="../Cpp2CS.Output/Cpp2CS.Output.csproj" />
+    <ProjectReference Include="../Cpp2CS.Pipeline/Cpp2CS.Pipeline.csproj" />
+  </ItemGroup>
+</Project>

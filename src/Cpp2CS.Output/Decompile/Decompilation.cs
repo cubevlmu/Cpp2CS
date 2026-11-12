@@ -24,10 +24,12 @@ public static partial class Decompilation
         AggressiveInlining = true,
         FieldKeyword = !recoveringBodies,
         StructDefaultConstructorsAndFieldInitializers = !recoveringBodies,
+        // 恢复体可能只有部分状态转移；保留显式状态机，避免协程识别丢失状态变量的定义。
+        YieldReturn = !recoveringBodies,
     };
 
     /// <summary>与 ILSpy 导出工程（WholeProjectDecompiler）相同的附加变换：转义非法标识符（编译器生成的名字）、去掉 CLSCompliant。</summary>
-    private static CSharpDecompiler CreateDecompiler(DecompilerTypeSystem typeSystem, DecompilerSettings settings, IDecompileTransformProvider? transforms)
+    private static CSharpDecompiler CreateDecompiler(DecompilerTypeSystem typeSystem, DecompilerSettings settings, IDecompileTransformProvider? transforms, bool recoveringBodies)
     {
         var decompiler = new CSharpDecompiler(typeSystem, settings);
         decompiler.AstTransforms.Insert(decompiler.AstTransforms.ToList().FindIndex(t => t is DeclareVariables), new GotoCleanup());
@@ -44,6 +46,11 @@ public static partial class Decompilation
         transforms?.Register(decompiler, DecompilePosition.AfterLegality);
         decompiler.AstTransforms.Add(new EventFieldNames());
         transforms?.Register(decompiler, DecompilePosition.AfterEvents);
+        if (recoveringBodies)
+        {
+            decompiler.AstTransforms.Add(new ExternalStaticTypeNames());
+            decompiler.AstTransforms.Add(new EscapeInvalidIdentifiers());
+        }
         return decompiler;
     }
 
@@ -116,7 +123,7 @@ public static partial class Decompilation
             var (handles, ns, name) = types[i];
             try
             {
-                var tree = CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(handles);
+                var tree = CreateDecompiler(typeSystem, settings, transforms, recoveringBodies).DecompileTypes(handles);
                 results.Add((i, new SourceFile(name, ns, Print(tree, settings))));
             }
             // 只有调用方提供了占位程序集才继续（--keep-going）；否则照常中断。
@@ -136,7 +143,7 @@ public static partial class Decompilation
         }
         if (assemblyAttributes)
         {
-            var decompiler = CreateDecompiler(typeSystem, settings, transforms);
+            var decompiler = CreateDecompiler(typeSystem, settings, transforms, recoveringBodies);
             decompiler.AstTransforms.Add(new RemoveCompilerGeneratedAssemblyAttributes());
             var tree = decompiler.DecompileModuleAndAssemblyAttributes();
             // ILSpy 按程序集版本合成 [assembly: AssemblyVersion]；0.0.0.0 是不写该特性时的默认值，去掉（AssemblyVersionAttribute 可能已被裁剪）

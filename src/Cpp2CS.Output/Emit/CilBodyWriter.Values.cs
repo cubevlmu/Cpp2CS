@@ -32,7 +32,7 @@ internal sealed partial class CilBodyWriter
                 break;
             case HoleValue hole:
                 il.Emit(OpCodes.Ldc_I8, unchecked((long)statementAddress));
-                il.Emit(OpCodes.Call, new GenericInstanceMethod(Unrecovered().Value) { GenericArguments = { TypeReference(hole.Type) } });
+                il.Emit(OpCodes.Call, HoleMethod(hole.Type));
                 break;
             case ConstantValue c:
                 if (c.Type is GenericParameterRef { IsReferenceConstrained: false })
@@ -122,6 +122,13 @@ internal sealed partial class CilBodyWriter
                 // 值类型的访问器是实例方法：this 是该值的地址（ldloca/ldflda），不能先读出值。
                 if (f.Accessor is { Method.Method.Owner.IsValueType: true } structGetter)
                 {
+                    // ref 参数或 ref 局部本身已是结构体地址，不能再生成 T&&。
+                    if (f.Receiver.Type is ByRefRef)
+                    {
+                        Value(f.Receiver);
+                        AccessorCall(structGetter);
+                        break;
+                    }
                     // 访问器已证明等于这次字段读取，直接在变量上调用，不需要副本。
                     if (f.Receiver is LocalValue or ArgumentValue { Index: >= 0 })
                     {

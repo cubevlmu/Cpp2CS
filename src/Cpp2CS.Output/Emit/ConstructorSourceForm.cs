@@ -54,6 +54,8 @@ internal static class ConstructorSourceForm
                 FieldHandleValue f => $"ldtoken({f.Field})",
                 MethodHandleValue m => $"ldtoken({m.Method})",
                 StaticFieldValue f => $"{f.Field}",
+                StaticCallValue c => $"static-call#{c.Method.Method.Index}:{c.Method}:{c.Type}/{c.Width}:{c.Inlined}",
+                DelegateValue d => Children($"delegate {d.DelegateType}:{d.Binding}:{d.Method.Method.Index}:{d.Method}", [d.Target]),
                 NewObjectValue n => Children($"new#{n.Constructor.Method.Index} {n.Constructor}", n.Arguments),
                 NewArrayValue a => Children($"new {a.ArrayType}", [a.Length]),
                 ComposedValue c => Children($"struct {c.StructType}:{string.Join("/", c.Leaves.Select(l => string.Join(".", l.Path.Select(f => f.Field.Index))))}", c.Leaves.Select(l => l.Value)),

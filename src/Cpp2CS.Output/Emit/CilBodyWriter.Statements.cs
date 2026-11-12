@@ -63,6 +63,8 @@ internal sealed partial class CilBodyWriter
                     for (var i = 0; i < cases.Length; i++) { il.Append(cases[i]); Edge(w.Cases[i]); }
                     break;
                 }
+            case ManagedThrow { Exception: HoleValue }:
+                il.Emit(OpCodes.Ldc_I8, unchecked((long)statementAddress)); il.Emit(OpCodes.Call, Unrecovered().Fail); il.Emit(OpCodes.Throw); break;
             case ManagedThrow t: Value(t.Exception); il.Emit(OpCodes.Throw); break;
             case ManagedRethrow: il.Emit(OpCodes.Rethrow); break;
             case ManagedEndFault: il.Emit(OpCodes.Endfinally); break;
@@ -131,6 +133,22 @@ internal sealed partial class CilBodyWriter
         var instance = new GenericInstanceMethod(method);
         foreach (var argument in arguments) instance.GenericArguments.Add(TypeReference(argument));
         return instance;
+    }
+
+    private MethodReference HoleMethod(TypeRef type)
+    {
+        var marker = Unrecovered().Value;
+        if (type is not (ByRefRef or PointerRef) && !ManagedTypes.IsByRefLike(type))
+            return new GenericInstanceMethod(marker) { GenericArguments = { TypeReference(type) } };
+        var key = (destination.Module, type);
+        if (symbols.ConcreteHoles.TryGetValue(key, out var known)) return known;
+        var helper = new MethodDefinition("Value_" + marker.DeclaringType.Methods.Count,
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig, TypeReference(type));
+        helper.Parameters.Add(new ParameterDefinition("address", ParameterAttributes.None, TypeReference(types.UInt64)));
+        helper.Body.GetILProcessor().Emit(OpCodes.Ldnull); helper.Body.GetILProcessor().Emit(OpCodes.Throw);
+        marker.DeclaringType.Methods.Add(helper);
+        symbols.ConcreteHoles.Add(key, helper);
+        return helper;
     }
 
     /// <summary>

@@ -17,6 +17,8 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
     public int Limit { get; init; } = int.MaxValue;
     public int Jobs { get; init; } = 1;
     public bool NoSource { get; init; }
+    /// <summary>是否恢复输出所需的透明依赖；关闭时仍执行依赖完整性校验。</summary>
+    public bool RecoverDependencies { get; init; } = true;
     /// <summary>只导出桩：不恢复方法体，每个方法都是占位体。类型、成员和签名与正常导出相同。</summary>
     public bool StubsOnly { get; init; }
     /// <summary>
@@ -24,7 +26,7 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
     /// 用来得到结构完整的工程；排查问题时不要开，崩溃的堆栈只留下第一行。
     /// </summary>
     public bool KeepGoing { get; init; }
-    /// <summary>单个方法的恢复时限（秒），超时自动跳过该方法，默认 30 秒。</summary>
+    /// <summary>单个方法的恢复时限（秒），零表示不限制，默认 30 秒。</summary>
     public int MethodTimeoutSeconds { get; init; } = 30;
     /// <summary>恢复过程进程内存占用上限（MB），默认 8192 MB。接近阈值主动 GC，超过上限跳过方法以避免 OOM 崩溃。</summary>
     public long MaxMemoryMB { get; init; } = 8192;
@@ -41,7 +43,7 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
         if (!HasScope) throw new ArgumentException("必须且只能指定一种恢复范围");
         if (Jobs < 1) throw new ArgumentException("--jobs 必须大于零");
         if (Limit < 1) throw new ArgumentException("--limit 必须大于零");
-        if (MethodTimeoutSeconds < 1) throw new ArgumentException("--method-timeout 必须大于零");
+        if (MethodTimeoutSeconds < 0) throw new ArgumentException("--method-timeout 不能为负数，零表示不限制");
         if (MaxMemoryMB < 0) throw new ArgumentException("--max-memory-mb 不能为负数");
         if (SourceLayout is not ("flat" or "project")) throw new ArgumentException("--source-layout 必须是 flat 或 project");
     }
@@ -55,6 +57,7 @@ public sealed record RecoveryRequest(string Binary, string Metadata, string Outp
             var option = options[i];
             if (option == "--all") { request = request with { All = true }; scopes++; continue; }
             if (option == "--no-source") { request = request with { NoSource = true }; continue; }
+            if (option == "--no-dependencies") { request = request with { RecoverDependencies = false }; continue; }
             if (option == "--stubs-only") { request = request with { StubsOnly = true }; continue; }
             if (option == "--keep-going") { request = request with { KeepGoing = true }; continue; }
             if (option is "--overwrite" or "--clean") { request = request with { Overwrite = true }; continue; }

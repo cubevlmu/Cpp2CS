@@ -22,7 +22,8 @@ internal static class CoreProfile
         return outcome;
     }
 
-    internal static RecoveryRunResult Run(RecoveryRequest request, Action<string>? progress)
+    internal static RecoveryRunResult Run(RecoveryRequest request, Action<string>? progress,
+        Func<Action<string>, ProgramFacts>? buildFacts = null)
     {
         void Log(string message) => progress?.Invoke(message);
         Log($"=== Cpp2CS 启动恢复流程 ===");
@@ -37,7 +38,8 @@ internal static class CoreProfile
 
         var manifest = new RunManifest(request);
         Log($"[阶段 1/6: Facts] 开始建立基础事实与代码映射...");
-        var facts = manifest.Step("facts", () => FactsBuilder.Build(request.Binary, request.Metadata, Log, options: request.Options));
+        var facts = manifest.Step("facts", () => buildFacts is null
+            ? FactsBuilder.Build(request.Binary, request.Metadata, Log, options: request.Options) : buildFacts(Log));
         Log($"[阶段 1/6: Facts] 基础事实构建完成");
 
         var types = new ManagedTypes(facts.Model, facts.Layouts);
@@ -60,7 +62,8 @@ internal static class CoreProfile
         var dependencies = new List<MethodRecoveryResult>();
         manifest.Step("dependencies", () =>
         {
-            DependencyClosure.Complete(targets, dependencies, targets.ToDictionary(r => r.Method.Method), summaries, Log);
+            if (request.RecoverDependencies)
+                DependencyClosure.Complete(targets, dependencies, targets.ToDictionary(r => r.Method.Method), summaries, Log);
             return dependencies.Count;
         });
         Log($"[阶段 4/6: Dependencies] 依赖解析完成，补充 {dependencies.Count} 个依赖方法");
@@ -75,9 +78,10 @@ internal static class CoreProfile
         var bodies = results.Where(r => r.Body is not null).Select(r => r.Body!);
         var effectiveKeepGoing = request.KeepGoing || guard is not null;
         var problems = effectiveKeepGoing ? emitter.CheckEach(bodies, EmissionPolicy.Recovered) : emitter.Check(bodies, EmissionPolicy.Recovered);
+        var checkedProblems = emitter.Check(bodies, EmissionPolicy.Checked);
         DependencyClosure.Validate(results, problems);
         var published = PublishStage.Run(results, dependencyMethods, emitter, problems, effectiveKeepGoing);
-        var marked = effectiveKeepGoing ? PublishStage.MarkUnrecovered(results, published, emitter) : 0;
+        var marked = PublishStage.MarkUnrecovered(results, published, emitter);
         var emitted = published.Emitted;
         var partialEmitted = published.PartialEmitted;
         var emitProblems = published.Problems;
@@ -92,9 +96,13 @@ internal static class CoreProfile
         ReportStage.WriteRecovery(output, results, bytes, dependencyMethods, emitProblems, partialEmitted,
             _ => "native-recovery", _ => null);
         ReportStage.WriteTraces(output, targets);
+        ReportStage.WriteManagedChecks(output, facts, results, emitted, dependencyMethods, skeleton, checkedProblems);
+        ReportStage.WriteWindowsExceptions(output, facts, results);
+        ReportStage.WriteNativeContracts(output, facts);
         ReportStage.WriteEmitted(output, emitted, skeleton, dependencyMethods);
         var sourceProblems = SourceSuitability.Check(emitted.Select(r => r.Body!).Concat(partialEmitted.Select(r => r.Partial!)));
         ReportStage.WriteSourceProblems(output, sourceProblems);
+        ReportStage.WriteCoverage(output, facts, targets, emitted, checkedProblems, sourceProblems);
         ReportStage.WriteUnselected(output, selection);
         var selectedSet = targets.ToHashSet();
         var report = Report(targets, emitted.Where(selectedSet.Contains).ToList(), emitProblems.Where(p => selectedSet.Contains(p.Key)).ToDictionary(),

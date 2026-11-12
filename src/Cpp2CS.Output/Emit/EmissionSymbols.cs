@@ -7,6 +7,7 @@ namespace Cpp2CS.Output;
 internal sealed class EmissionSymbols
 {
     public Dictionary<ModuleDefinition, (MethodReference At, MethodReference Fail, MethodDefinition Value)> Unrecovered { get; } = new();
+    public Dictionary<(ModuleDefinition Module, TypeRef Type), MethodDefinition> ConcreteHoles { get; } = new();
     public Dictionary<ModuleDefinition, (MethodDefinition Of, MethodDefinition Do, MethodDefinition Result, MethodDefinition Completed, MethodDefinition CompletedVoid)> Awaits { get; } = new();
     public HashSet<Instruction> ExplicitInitializations { get; } = [];
     public Dictionary<Instruction, FieldAccessor> AccessorCalls { get; } = [];

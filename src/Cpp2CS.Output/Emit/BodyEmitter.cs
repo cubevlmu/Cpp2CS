@@ -1,4 +1,5 @@
 using Mono.Cecil.Cil;
+using Cpp2CS.Ir;
 
 namespace Cpp2CS.Output;
 
@@ -46,6 +47,16 @@ public class BodyEmitter(Skeleton skeleton, ManagedTypes types, IEmissionTransfo
             }
             if (Build(recovered, policy, method) is var body && CilStackTypes.Check(method, body) is { } stack)
             {
+                if (diagnostics?.Emit == true)
+                {
+                    var details = recovered.Blocks.SelectMany(b => b.Statements).SelectMany(s => ManagedValues.Of(s)
+                        .Concat(ManagedValues.Edges(s).SelectMany(e => e.Copies).SelectMany(c => new ManagedValue[] { c.Target, c.Value }))
+                        .SelectMany(ManagedValues.Walk).Where(v => v is ConversionValue or BinaryValue or UnaryValue or ComparisonValue
+                            && ManagedValues.Children(v).Any(c => ManagedTypes.IsReferenceType(c.Type) || c.Type is PrimitiveRef { Name: "object" }))
+                        .Select(v => $"0x{s.Address:x}: {v}"));
+                    diagnostics.Write("emit.stack", recovered.Method.Method.Address,
+                        $"{recovered.Method}: {stack}{Environment.NewLine}{string.Join(Environment.NewLine, details)}");
+                }
                 problems.Add(recovered, new(EmissionProblemKind.StackType, stack, recovered.Method));
                 continue;
             }

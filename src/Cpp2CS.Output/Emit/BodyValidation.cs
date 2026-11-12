@@ -35,6 +35,8 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
         foreach (var statement in recovered.Blocks.SelectMany(b => b.Statements))
         {
             address = statement.Address;
+            if (statement is ManagedHole && policy != EmissionPolicy.Partial)
+                return new(EmissionProblemKind.Unsupported, "未恢复语句只允许部分阅读体");
             if (statement is ManagedAssignment assignment && ScalarCopyProblem(assignment.Target, assignment.Value) is { } assignmentProblem)
                 return assignmentProblem;
             foreach (var copy in ManagedValues.Edges(statement).SelectMany(e => e.Copies))
@@ -106,7 +108,13 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                 if (DelegateProblem(delegated) is { } delegateProblem) return delegateProblem;
                 break;
             case StringValue: return value.Type.Equals(types.String) ? null : new(EmissionProblemKind.Unsupported, "字符串常量类型不符");
-            case HoleValue: return null;
+            case HoleValue hole:
+                if (policy != EmissionPolicy.Partial) return new(EmissionProblemKind.Unsupported, "未恢复值只允许部分阅读体");
+                if (hole.Type is DefinitionRef { Definition.FullName: "System.TypedReference" })
+                    return new(EmissionProblemKind.Unsupported, "缺口 TypedReference 不能表示为源码返回类型");
+                if ((hole.Type is ByRefRef or PointerRef || ManagedTypes.IsByRefLike(hole.Type)) && !ClosedHoleType(hole.Type))
+                    return new(EmissionProblemKind.Unsupported, "缺口 受限返回类型含未绑定泛型参数");
+                return null;
             case AsyncResultValue: break;
             case TypeHandleValue handle:
                 if (!CanAccess(handle.Target)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {handle.Target}");
@@ -125,8 +133,10 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                 break;
             case NewArrayValue array:
                 if (!array.ArrayType.IsVector) return new(EmissionProblemKind.Unsupported, "数组 分配需要一维向量类型");
+                if (ManagedTypes.IsByRefLike(array.ArrayType.Element)) return new(EmissionProblemKind.Unsupported, "数组 元素不能是受限值类型");
                 break;
             case BoxValue box:
+                if (ManagedTypes.IsByRefLike(box.Boxed)) return new(EmissionProblemKind.Unsupported, "装箱 受限值类型不能装箱");
                 if (!CanAccess(box.Boxed)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {box.Boxed}");
                 if (box.Boxed is not GenericParameterRef && !Boxable(box.Boxed)) return new(EmissionProblemKind.Unsupported, $"装箱 类型 {box.Boxed}");
                 break;
@@ -136,6 +146,7 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                     && unbox.Target is not GenericParameterRef { NativeScalar: not null }) return new(EmissionProblemKind.Unsupported, $"拆箱 类型 {unbox.Target} 尚未支持");
                 break;
             case UnboxValue unbox:
+                if (ManagedTypes.IsByRefLike(unbox.Target)) return new(EmissionProblemKind.Unsupported, "拆箱 受限值类型不能存入对象");
                 if (!ManagedTypes.IsReferenceType(unbox.Operand.Type)) return new(EmissionProblemKind.Unsupported, "拆箱值需要对象来源");
                 break;
             case CheckedCastValue cast:
@@ -206,12 +217,17 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                 if (CilOperators.Unary(u.Op) is null && CilOperators.Math(u.Op) is null)
                     return new(EmissionProblemKind.Unsupported, $"运算 {u.Op} 尚未支持 CIL 写出");
                 break;
+            case ConversionValue c when ManagedTypes.IsReferenceType(c.Operand.Type) && !ManagedTypes.IsReferenceType(c.Type):
+                return new(EmissionProblemKind.Unsupported, "转换 托管引用没有数值地址投影证明");
             case ConversionValue { Kind: ConvKind.FloatToSInt or ConvKind.FloatToUInt, Width: not (32 or 64) }:
                 return new(EmissionProblemKind.Unsupported, "浮点转换 目标需要 32 或 64 位整数");
             case ConversionValue c when c.Type is not GenericParameterRef { NativeScalar: not null }
                 && c.Kind != ConvKind.Bitcast && (c.Width == 0 || c.Operand.Width == 0):
                 return new(EmissionProblemKind.Unsupported, "转换 缺少标量位宽");
             case ComparisonValue c:
+                if ((ManagedTypes.IsReferenceType(c.Left.Type) || ManagedTypes.IsReferenceType(c.Right.Type))
+                    && c.Condition is not (Cond.Eq or Cond.Ne))
+                    return new(EmissionProblemKind.Unsupported, "比较 托管引用只支持已证明的相等或判空关系");
                 if ((c.Left.Width == 0 || c.Right.Width == 0)
                     && !ManagedTypes.IsReferenceType(c.Left.Type) && !ManagedTypes.IsReferenceType(c.Right.Type))
                     return new(EmissionProblemKind.Unsupported, "比较 非引用操作数缺少标量位宽");
@@ -258,8 +274,19 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
     }
 
     // IntPtr/UIntPtr 是可装箱的 CLR 值类型；裸指针与托管地址仍不可装箱。
-    private bool Boxable(TypeRef type) => types.Kind(type) is TypeKind.Int or TypeKind.Bool or TypeKind.Float or TypeKind.Double or TypeKind.Struct
-        || type.Equals(types.IntPtr) || type.Equals(types.Corlib("System.UIntPtr"));
+    private static bool ClosedHoleType(TypeRef type) => type switch
+    {
+        GenericParameterRef => false,
+        DefinitionRef definition => definition.Arguments.All(ClosedHoleType),
+        ByRefRef reference => ClosedHoleType(reference.Element),
+        PointerRef pointer => ClosedHoleType(pointer.Element),
+        ArrayRef array => ClosedHoleType(array.Element),
+        _ => true,
+    };
+
+    private bool Boxable(TypeRef type) => !ManagedTypes.IsByRefLike(type)
+        && (types.Kind(type) is TypeKind.Int or TypeKind.Bool or TypeKind.Float or TypeKind.Double or TypeKind.Struct
+            || type.Equals(types.IntPtr) || type.Equals(types.Corlib("System.UIntPtr")));
 
     private EmissionProblem? DelegateProblem(DelegateValue value)
     {
