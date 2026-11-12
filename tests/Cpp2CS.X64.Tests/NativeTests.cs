@@ -127,6 +127,3 @@ internal static class NativeTests
         if (!condition) throw new InvalidOperationException(reason);
     }
 }
-
-
-
