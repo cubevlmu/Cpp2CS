@@ -27,6 +27,29 @@ namespace Cpp2CS.Tests;
 /// <summary>用匹配输入提供类型与运行时定义；证明边界使用独立的小型托管方法体。</summary>
 internal static class ArchitectureChecks
 {
+    /// <summary>无需样本映像的公共 IR 边界检查；完整模型与平台回归仍由 Run 执行。</summary>
+    public static int RunStructural()
+    {
+        var checks = new Assertions();
+        CallIdentities(checks);
+        SharedInterfacePartitions(checks);
+        SharedInterfaceContinuations(checks);
+        LowHalfArithmetic(checks);
+        NestedEnumStack(checks);
+        LowBitArithmetic(checks);
+        PackedPhiSlices(checks);
+        JoinedPhiSlices(checks);
+        AssembledPieces(checks);
+        CleanupDispatch(checks);
+        ArrayIndices(checks);
+        CardMarkingBarriers(checks);
+        CheckedByteArrays(checks);
+        AffineInductions(checks);
+        ArrayOffsetInductions(checks);
+        Verdicts(checks);
+        return checks.Finish("公共 IR 架构边界");
+    }
+
     public static int Run(string binary, string metadata, string cache)
     {
         var facts = FactsBuilder.Build(binary, metadata, options: new RecoveryOptions { FactCacheFile = Path.GetFullPath(cache) });
