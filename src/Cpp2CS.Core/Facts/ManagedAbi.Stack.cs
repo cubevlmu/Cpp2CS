@@ -10,6 +10,7 @@ public sealed partial class ManagedAbi
     public AbiPiece[] StackPieces(StackAbiValue value)
     {
         if (value.Indirect || Kind(value.Type) != ValueKind.Struct) return [];
+        if (architecture == Architecture.X64) return value.Size is 1 or 2 or 4 or 8 ? [new(Ir.Storage.Slot(value.Offset), value.Size * 8, 0)] : [];
         if (Hfa(value.Type) is { } hfa)
             return Enumerable.Range(0, hfa.Count).Select(i => new AbiPiece(Ir.Storage.Slot(value.Offset + i * hfa.Width / 8), hfa.Width, i * hfa.Width / 8)).ToArray();
         if (value.Size is <= 0 or > 16) return [];
@@ -23,6 +24,20 @@ public sealed partial class ManagedAbi
     /// </summary>
     public StackAbiSignature StackArguments(AbiSignature signature)
     {
+        if (architecture == Architecture.X64)
+        {
+            var position = (signature.Return?.Passing == Passing.Indirect ? 1 : 0) + (signature.This is null ? 0 : 1);
+            var values = new List<StackAbiValue>();
+            for (var index = 0; index < signature.Parameters.Length; index++, position++)
+            {
+                var value = signature.Parameters[index];
+                if (value.Passing != Passing.Stack) continue;
+                var size = Size(value.Type);
+                var indirect = Kind(value.Type) == ValueKind.Struct && size is not (1 or 2 or 4 or 8);
+                values.Add(new(index, value.Type, 8 + position * 8, indirect ? 8 : size, indirect));
+            }
+            return new(values.ToArray(), signature.MethodInfo is null ? 8 + position * 8 : null, Math.Max(32, (position + 1) * 8));
+        }
         var stack = 0;
         var parameters = new List<StackAbiValue>();
         static int Round(int n, int alignment) => checked((n + alignment - 1) / alignment * alignment);

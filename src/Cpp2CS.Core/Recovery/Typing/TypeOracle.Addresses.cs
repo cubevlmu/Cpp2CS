@@ -246,7 +246,7 @@ public sealed partial class TypeOracle
             }
             var start = syms.Const(unchecked((ulong)seed.Element) & Expr.Mask(32), 32);
             if (seed.Index is not { } position) { syms.SetSource(counter, edge, start); continue; }
-            var bits = ArrayIndex(position);
+            var bits = ArrayIndexValue(position);
             if (bits.Width < 32) return null;
             syms.SetSource(counter, edge, syms.Binary(BinOp.Add, syms.Slice(bits, 0, 32), start, 32));
         }

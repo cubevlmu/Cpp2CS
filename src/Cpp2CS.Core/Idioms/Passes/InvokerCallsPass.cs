@@ -13,30 +13,44 @@ namespace Cpp2CS.Idioms;
 /// </summary>
 internal static class InvokerCallsPass
 {
-    internal static bool InvokerCalls(this IdiomState state) => Run(state.function, state.defs, state.self, state.owner.abi, IsConstrainedCall(state.owner), state.Reject);
+    internal static bool InvokerCalls(this IdiomState state) => Run(state.function, state.defs, state.self, state.owner.abi, state.facts, IsConstrainedCall(state.owner), state.Reject);
 
     /// <summary>路径拆分之后 MethodInfo 才成为单一实体的调用；规则与 L2 相同，实体已代入当前实例。</summary>
     internal static void AfterSplitting(MachineFunction function, MethodRef self, IdiomRewriter rewriter)
     {
-        while (Run(function, new IdiomRewriter.Defs(function), self, rewriter.abi, IsConstrainedCall(rewriter), null)) { }
+        while (Run(function, new IdiomRewriter.Defs(function), self, rewriter.abi, rewriter.facts, IsConstrainedCall(rewriter), null)) { }
     }
 
     private static Func<Call, bool> IsConstrainedCall(IdiomRewriter owner) => call => owner.HelperOf(call)?.Kind == HelperKind.ConstrainedCall;
 
-    private static bool Run(MachineFunction function, IdiomRewriter.Defs defs, MethodRef? self, ManagedAbi abi, Func<Call, bool> isConstrained, Action<string, ulong, string>? reject)
+    private static bool Run(MachineFunction function, IdiomRewriter.Defs defs, MethodRef? self, ManagedAbi abi, ProgramFacts facts,
+        Func<Call, bool> isConstrained, Action<string, ulong, string>? reject)
     {
+        var win64 = facts.Model.Image.Architecture == Architecture.X64;
+        if (win64 && facts.Model.MetadataVersion != 31) return false;
+        var layout = facts.Base.RuntimeOffsets;
+        int? invokerOffset = win64 ? layout?.MethodInvoker : RuntimeLayout.MethodInvoker;
+        int? pointerOffset = win64 ? layout?.MethodPointer : RuntimeLayout.MethodPointer;
+        int? virtualOffset = win64 ? layout?.MethodVirtualPointer : RuntimeLayout.MethodVirtualPointer;
         Dictionary<Variable, Call>? lookups = null;
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
             {
                 if (block.Statements[i] is not Call { Op: null } call) continue;
-                Expr? Actual(int register) => call.ArgumentIndex(Storage.Gpr(register)) is var index && index >= 0 ? call.Arguments[index] : null;
+                Expr? Actual(int position)
+                {
+                    var source = !win64 ? Storage.Gpr(position) : position < 4 ? Storage.Gpr(new[] { 1, 2, 8, 9 }[position]) : Storage.Slot(position * 8);
+                    if (call.ArgumentIndex(source) is var at && at >= 0) return call.Arguments[at];
+                    // 调用点 SP 尚未压入返回地址；第五、第六指针位于 shadow space 之后。
+                    return win64 && position >= 4 && call.Kind is CallKind.Direct or CallKind.Indirect && call.StackPointer is { } sp
+                        ? new Load(Offset(sp, position * 8), 64) : null;
+                }
                 Expr? Input(int register) => Actual(register) is { } input ? defs.Expand(input) : null;
                 Call? replacement = null;
-                if (call.Kind == CallKind.Direct)
+                if (call.Kind == CallKind.Direct && isConstrained(call))
                 {
                     // il2cpp_codegen_runtime_constrained_call(klass, 约束项, boxBuffer, objBuffer, args, ret)；boxBuffer 只服务于运行时的装箱路径。
-                    if (!isConstrained(call) || Input(1) is not Symbol { Kind: SymbolKind.Constrained, Value: ValueTuple<TypeRef, MethodRef> constrained }
+                    if (Input(1) is not Symbol { Kind: SymbolKind.Constrained, Value: ValueTuple<TypeRef, MethodRef> constrained }
                         || Input(0) is not Symbol { Kind: SymbolKind.Class, Value: TypeRef klass } || !klass.Equals(constrained.Item1)
                         || Actual(3) is not { } location || Actual(4) is not { } slots || Actual(5) is not { } buffer) continue;
                     var signature = abi.ConstrainedInvoker(self is not null ? (TypeRef)GenericContext.Instantiate(constrained.Item1, self)! : constrained.Item1,
@@ -48,20 +62,32 @@ internal static class InvokerCallsPass
                     }
                     replacement = Unpacked(call, new(OpKind.InvokeConstrainedGeneric, constrained), constrained.Item2, location, slots, buffer);
                 }
-                else if (call.Kind == CallKind.Indirect && defs.Expand(call.Target) is Load { Width: 64 } target
-                    && SplitPass.Split(target.Address) is (var info, RuntimeLayout.MethodInvoker)
+                else if (win64 && call.Kind == CallKind.Direct && call.Target is Const registered
+                    && Input(1) is Symbol { Kind: SymbolKind.Method, Value: MethodRef directMethod } directInfo
+                    && facts.Registrations.InvokerOf.TryGetValue(directMethod.Method, out var invokerIndex) && invokerIndex >= 0
+                    && facts.EntriesAt(registered.Value).Any(e => e.Kind == EntryKind.Invoker && e.Index == invokerIndex)
+                    && (Input(0) is Const entry && entry.Value != 0 && entry.Value == directMethod.Method.Address
+                        || pointerOffset is { } directPointer && Input(0) == new Load(Offset(directInfo, directPointer), 64))
+                    && Actual(2) is { } directReceiver && Actual(3) is { } directArguments && Actual(4) is { } directOutput)
+                {
+                    if (Unsized(abi.Invoker(self is not null ? (MethodRef)GenericContext.Instantiate(directMethod, self)! : directMethod))) continue;
+                    replacement = Unpacked(call, new(OpKind.InvokeGeneric, directMethod), directMethod, directReceiver, directArguments, directOutput);
+                }
+                else if (call.Kind == CallKind.Indirect && invokerOffset is { } invokerField && pointerOffset is { } pointerField
+                    && defs.Expand(call.Target) is Load { Width: 64 } target
+                    && SplitPass.Split(target.Address) is (var info, var offset) && offset == (ulong)invokerField
                     && Input(1) == info && Input(2) is { } receiver && Actual(3) is { } arguments && Actual(4) is { } output)
                 {
                     MethodRef? method;
                     var dispatched = false;
                     if (info is Symbol { Kind: SymbolKind.Method, Value: MethodRef direct })
                     {
-                        if (Input(0) != new Load(info, 64)) continue;
+                        if (Input(0) != new Load(Offset(info, pointerField), 64)) continue;
                         method = direct;
                     }
                     else
                     {
-                        if (Input(0) != new Load(Offset(info, RuntimeLayout.MethodVirtualPointer), 64)) continue;
+                        if (virtualOffset is not { } virtualField || Input(0) != new Load(Offset(info, virtualField), 64)) continue;
                         lookups ??= function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
                             .Where(c => c.Op?.Kind is OpKind.InterfaceInvokeData or OpKind.ResolveGenericVirtual && c.Defines.Length > 0 && c.Defines[0] is not null)
                             .ToDictionary(c => c.Defines[0]);

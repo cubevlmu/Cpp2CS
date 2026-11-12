@@ -31,23 +31,46 @@ public sealed class FunctionLifter
     private readonly FactsCallModel knownCalls;
     private readonly ImageSection? got;
     private readonly ImageSection[] constant;
+    private readonly PeConstants peConstants;
+    private readonly NativeLeafInlining? nativeLeaves;
+    private readonly RuntimeForwarding? runtimeForwarding;
+    private readonly NativeBodyInlining? nativeBodies;
 
     public FunctionLifter(BaseFacts facts, ICallModel? calls = null) : this(new ProgramFacts(facts, new()), calls) { }
 
     public FunctionLifter(ProgramFacts facts, ICallModel? calls = null)
     {
         this.facts = facts;
-        Machine = new Arm64Machine(facts.Code);
+        Machine = facts.CreateMachine();
         cfg = new CfgBuilder(Machine, facts.Code);
+        if (Machine.Architecture == Architecture.X64)
+            foreach (var helper in facts.Helpers.Helpers.Values.Where(h => h.Kind is HelperKind.Raise or HelperKind.CodegenRaise or HelperKind.Rethrow
+                || h.Kind == HelperKind.Import && h.Detail == "_CxxThrowException"))
+                cfg.NoReturn.AddEvidence(helper.Address);
         knownCalls = new FactsCallModel(facts, Machine.Convention);
         this.calls = calls ?? knownCalls;
+        if (Machine.Architecture == Architecture.X64)
+        {
+            nativeLeaves = new(facts, Machine);
+            runtimeForwarding = new(facts, Machine);
+            nativeBodies = new(facts, cfg, knownCalls);
+        }
         var image = facts.Model.Image;
+        peConstants = new(image);
         got = image.Section(".got");
         constant = image.Sections.Where(s => (s.Flags & 1) == 0 && !s.Executable && s.Type == 1 /* SHT_PROGBITS */ && s.Name != ".got").ToArray();
     }
 
     /// <summary>恢复方法体（帧内存交给恢复层时）把外提的闭包函数展开回调用方；事实层的分析只看函数本身，不展开。</summary>
     public bool InlinesClosures { get; init; }
+
+    /// <summary>恢复层可展开已核实的短搬运体；原生输入与副本证明默认保留调用边界。</summary>
+    public bool InlinesNativeLeaves { get; init; }
+
+    /// <summary>恢复时展开有完整边界且栈平衡的短 x64 原生体；事实证明默认保留调用边界。</summary>
+    public bool InlinesNativeBodies { get; init; }
+    /// <summary>仅供入口依赖证明：锁前缀指令以全部物理输入的保守并集表示，不能用于恢复语义。</summary>
+    internal bool InputDependenciesOnly { get; init; }
 
     private readonly Dictionary<ulong, bool> closures = [];
     private readonly Dictionary<ulong, bool> outlined = [];
@@ -134,9 +157,10 @@ public sealed class FunctionLifter
     /// <summary>是否做帧槽提升（默认是）；环境变量 CPP2CS_FRAME_SLOTS=off 时关闭，用于对比与排查。</summary>
     public bool PromoteFrameSlots => facts.Options.PromoteFrameSlots;
 
-    public Arm64Machine Machine { get; }
+    public IMachine Machine { get; }
     public ICallModel Calls => calls;
     public NoReturnOracle NoReturn => cfg.NoReturn;
+    public string? WindowsExceptionProblem(ulong entry) => cfg.WindowsExceptionProblem(entry);
 
     /// <summary>returnValue 为函数自身返回值所在的寄存器读取（按签名）；为 null 时返回语句不读取任何值，返回值的计算会作为死定义删去。</summary>
     public LiftedFunction Lift(ulong entry, Expr? returnValue = null, bool simplify = true) => Lift(entry, returnValue, null, simplify, PromoteFrameSlots);
@@ -145,7 +169,44 @@ public sealed class FunctionLifter
     public LiftedFunction Lift(ulong entry, Expr? returnValue, ReturnPiece[]? returnPieces, bool simplify, bool promoteFrameSlots)
     {
         var function = cfg.Build(entry);
-        if (InlinesClosures && !promoteFrameSlots) new ClosureInlining(cfg, IsClosure, IsOutlinedHelper, Machine.Convention.IntegerArguments[0], Machine.Convention.StackPointer, Storage.Gpr(29), CalleeSaved).Run(function);
+        if (Machine.Architecture == Architecture.X64)
+        {
+            if (InputDependenciesOnly)
+            {
+                var marker = Storage.Temp(function.Blocks.SelectMany(b => b.Statements).OfType<Assign>()
+                    .Where(a => a.Target.Bank == Bank.Temp).Select(a => a.Target.Index).DefaultIfEmpty(999).Max() + 1);
+                foreach (var block in function.Blocks)
+                    for (var i = 0; i < block.Statements.Count; i++)
+                    {
+                        if (block.Statements[i] is Opaque opaque && opaque.Text.Contains("CALLOTHER LOCK:", StringComparison.Ordinal))
+                            block.Statements[i] = new Assign(opaque.Address, marker, new Intrinsic("input_only_locked_instruction",
+                                Enumerable.Range(0, 16).Select(n => (Expr)new Read(Storage.Gpr(n), 64))
+                                    .Concat(Enumerable.Range(0, 16).Select(n => (Expr)new Read(Storage.Vec(n), 128)))
+                                    .Concat(Enumerable.Range(200, 9).Select(n => (Expr)new Read(new Storage(Bank.Temp, n, 8), 8))).ToArray(), 64)) { PreserveRead = true };
+                        if (block.Statements[i] is not Call { Target: Read target } call) continue;
+                        var assigned = block.Statements.Take(i).OfType<Assign>().LastOrDefault(a => a.Address == call.Address && a.Target == target.Storage);
+                        if (assigned?.Value is Load { Width: 64, Address: Const slot } load && facts.Model.Image.Imports.ContainsKey(slot.Value))
+                            block.Statements[i] = call with { Target = load };
+                    }
+            }
+            var problems = function.Problems.Concat(function.Blocks.SelectMany(b => b.Statements).OfType<Opaque>()
+                .Select(o => $"0x{o.Address:x}: {o.Text}"))
+                .Concat(function.Blocks.SelectMany(b => b.Statements).OfType<Trap>()
+                    .Select(t => $"0x{t.Address:x}: 可达陷阱 {t.Kind} 的异常恢复语义尚未建模")).ToArray();
+            if (problems.Length > 0) return new(function, problems);
+        }
+        if (Machine.Architecture == Architecture.Arm64 && InlinesClosures && !promoteFrameSlots) new ClosureInlining(cfg, IsClosure, IsOutlinedHelper, Machine.Convention.IntegerArguments[0], Machine.Convention.StackPointer, Storage.Gpr(29), CalleeSaved).Run(function);
+        if (InlinesNativeLeaves)
+        {
+            runtimeForwarding?.Run(function);
+            nativeLeaves?.Run(function);
+        }
+        if (InlinesNativeBodies)
+        {
+            nativeBodies?.Run(function);
+            // 展开的包装可能引入新的运行时调用，须在建立调用 SSA 前补齐身份与签名。
+            if (InlinesNativeLeaves) runtimeForwarding?.Run(function);
+        }
         var dominators = Dominators.Compute(function);
         SsaBuilder.PrepareCalls(function, calls, returnValue, Machine.Convention.StackPointer, returnPieces);
         SsaBuilder.Build(function, dominators, s => s.Bank is Bank.Gpr or Bank.Vec or Bank.Flags or Bank.Temp, calls, Machine.Convention.StackPointer);
@@ -171,7 +232,16 @@ public sealed class FunctionLifter
         var changed = false;
         Expr? Fold1(Expr e)
         {
-            if (e is not Load { Address: Const address } load || ConstantAt(address.Value, load.Width) is not { } value) return null;
+            if (e is not Load { Address: Const address } load) return null;
+            if (load.Width == 128 && facts.Model.Image.Architecture == Architecture.X64
+                && facts.Model.Image.SectionAt(address.Value) is { } section
+                && section.Size - (address.Value - section.Address) >= 16
+                && ConstantAt(address.Value, 64) is { } low && ConstantAt(address.Value + 8, 64) is { } high)
+            {
+                changed = true;
+                return new Insert(new Insert(Expr.C(0, 128), Expr.C(low, 64), 0), Expr.C(high, 64), 64);
+            }
+            if (ConstantAt(address.Value, load.Width) is not { } value) return null;
             changed = true;
             return Expr.C(value, load.Width);
         }
@@ -189,6 +259,7 @@ public sealed class FunctionLifter
     public ulong? ConstantAt(ulong address, int width)
     {
         var image = facts.Model.Image;
+        if (image.Architecture == Architecture.X64) return peConstants.Read(address, width);
         if (got is not null && got.Contains(address))
             return width == 64 && (address & 7) == 0 ? image.RelocatedPointer(address) : null;
         if (width is not (8 or 16 or 32 or 64)) return null;

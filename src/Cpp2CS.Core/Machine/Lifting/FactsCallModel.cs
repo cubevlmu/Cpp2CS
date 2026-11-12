@@ -27,15 +27,17 @@ public sealed class FactsCallModel : ICallModel
     private readonly ManagedAbi abi;
     private readonly ConservativeCallModel conservative;
     private readonly CallingConvention convention;
+    private readonly bool useNativeCopies;
     private readonly Dictionary<ulong, CallSignature?> cache = new();
 
     public FactsCallModel(BaseFacts facts, CallingConvention convention) : this(new ProgramFacts(facts, new()), convention) { }
 
-    public FactsCallModel(ProgramFacts facts, CallingConvention convention)
+    public FactsCallModel(ProgramFacts facts, CallingConvention convention, bool useNativeCopies = true)
     {
         this.facts = facts;
         this.convention = convention;
-        abi = new ManagedAbi(facts.Layouts);
+        this.useNativeCopies = useNativeCopies;
+        abi = facts.CreateAbi();
         conservative = new ConservativeCallModel(convention);
     }
 
@@ -92,13 +94,37 @@ public sealed class FactsCallModel : ICallModel
             signature = new(adjustedSignature.Reads, adjustedSignature.Results, "registered-adjustor-target") { MethodInfo = adjustedSignature.MethodInfo?.Register };
         else if (facts.Unregistered.At(target) is { } identity)
             signature = new(identity.Abi.Reads, identity.Abi.Results, "inferred-definition") { MethodInfo = identity.Abi.MethodInfo?.Register };
-        else if (facts.Helpers.At(target) is { } helper) signature = Helper(helper);
+        else if (facts.Helpers.At(target) is { } helper) signature = facts.Model.Image.Architecture == Architecture.X64 ? Win64Helper(helper) : Helper(helper);
         else
         {
+            if (facts.Model.Image.Architecture == Architecture.X64)
+            {
+                var entries = facts.EntriesAt(target);
+                if (entries.Length == 0 && useNativeCopies) entries = facts.NativeCopies.At(target);
+                // 元数据 31 的 InvokerMethod 返回 void；第五参数由调用点 SP 读取，不伪造寄存器结果。
+                if (facts.Model.MetadataVersion == 31 && entries.Length > 0 && entries.All(e => e.Kind == EntryKind.Invoker))
+                    return cache[target] = new([X(1), X(2), X(8), X(9)], [], "Win64-invoker");
+                var classified = entries.Where(e => e.Kind is EntryKind.Method or EntryKind.GenericMethod or EntryKind.AdjustorThunk or EntryKind.GenericAdjustorThunk)
+                    .Select(e => e.Method is { } method ? abi.Classify(method, out _) : null).ToArray();
+                // ICF 可合并不同签名。机器层保留各候选的输入/输出并集，托管身份仍由后续形状和类型证明决定。
+                if (!entries.Any(e => e.Kind == EntryKind.Invoker) && classified.Length > 0 && classified.All(s => s is not null))
+                    signature = new(classified.SelectMany(s => s!.Reads).Distinct().ToArray(),
+                        classified.SelectMany(s => s!.Results).Distinct().ToArray(),
+                        facts.EntriesAt(target).Length == 0 ? "Win64-proven-copy-union" : "Win64-metadata-union")
+                    {
+                        MethodInfo = classified.Select(s => s!.MethodInfo?.Register).Distinct().ToArray() is [var info] ? info : null,
+                    };
+                if (signature is null && facts.NativeCalls.At(target) is { } native)
+                    signature = new(native.Inputs, native.Written, "proven-native-straight-line");
+                if (signature is null && facts.NativeInputs.TryGetValue(target, out var inputs))
+                    signature = new(inputs.Reads, convention.IntegerResults.Concat(convention.FloatResults).ToArray(), "Win64-export-derived-native-inputs");
+                return cache[target] = signature;
+            }
             foreach (var entry in facts.EntriesAt(target))
             {
                 if (entry.Kind == EntryKind.Invoker)
                 {
+                    if (facts.Model.Image.Architecture == Architecture.X64) break;
                     // void (*InvokerMethod)(Il2CppMethodPointer, const MethodInfo*, void* obj, void** args, void* returnValue)
                     signature = new([X(0), X(1), X(2), X(3), X(4)], [], "invoker");
                     break;
@@ -116,12 +142,51 @@ public sealed class FactsCallModel : ICallModel
     }
 
     private CallSignature? Of(Call call) =>
+        call.Op?.Kind == OpKind.MemoryBarrier ? new([], [], "machine-memory-barrier") :
+        facts.Model.Image.Architecture == Architecture.X64 && call.Target is Load { Width: 64, Address: Const slot }
+            && facts.Model.Image.Imports.TryGetValue(slot.Value, out var name)
+            && facts.Model.Image.ImportModules.GetValueOrDefault(slot.Value)?.ToLowerInvariant() is { } module
+            && WindowsImport(module, name) is { } imported ? imported :
         call is { Kind: CallKind.Direct or CallKind.Tail, Target: Const target } ? Signature(target.Value) : null;
+
+    private static CallSignature? WindowsImport(string module, string name)
+    {
+        // MSVC 无参自由函数的完整修饰尾部给出 ABI；这里只取得机器读写位置，不推断副作用。
+        if (name.StartsWith('?') && new[] { "@@YA_JXZ", "@@YA_KXZ", "@@YAHXZ", "@@YAIXZ", "@@YA_NXZ" }
+            .Any(tail => name.EndsWith(tail, StringComparison.Ordinal))) return new([], [X(0)], "Win64-decorated-import");
+        if (name.StartsWith('?') && name.EndsWith("@@YAXXZ", StringComparison.Ordinal)) return new([], [], "Win64-decorated-import");
+        if (module is not ("kernel32.dll" or "kernelbase.dll" or "ntdll.dll") && !module.StartsWith("api-ms-win-core-", StringComparison.Ordinal)) return null;
+        return name switch
+    {
+        "GetCurrentThreadId" or "GetCurrentProcessId" or "GetCurrentProcess" or "GetLastError" => new([], [X(0)], "Win64-system-import"),
+        "EnterCriticalSection" or "LeaveCriticalSection" or "RtlEnterCriticalSection" or "RtlLeaveCriticalSection" => new([X(1)], [], "Win64-system-import"),
+        _ => null,
+    };
+    }
+
+    private static CallSignature? Win64Helper(RuntimeHelper helper) => helper.Kind switch
+    {
+        HelperKind.ObjectNew or HelperKind.InitMetadata or HelperKind.InitializedTypeInfo => new([X(1)], [X(0)], "Win64-runtime"),
+        HelperKind.NewArray or HelperKind.Box or HelperKind.IsAssignableFrom => new([X(1), X(2)], [X(0)], "Win64-export"),
+        HelperKind.FieldAddress => new([X(1), X(2)], [X(0)], "Win64-field-address-proof"),
+        HelperKind.ClassInit or HelperKind.Raise or HelperKind.Rethrow => new([X(1)], [], "Win64-export"),
+        HelperKind.Throw => new([], [], "Win64-exception"),
+        HelperKind.CodegenRaise => new([X(1), X(2)], [], "Win64-codegen-throw"),
+        HelperKind.InterfaceLookup => new([X(1), X(2), X(8)], [X(0)], "Win64-interface-lookup"),
+        HelperKind.GcNotification => new([X(1)], [], "Win64-GC-notification"),
+        HelperKind.Import when helper.Detail == "_CxxThrowException" => new([X(1), X(2)], [], "Win64-Cxx-throw"),
+        HelperKind.Import when helper.Detail == "modf" => new([X(2), Storage.Vec(0)], [Storage.Vec(0)], "Win64-UCRT-out"),
+        HelperKind.Import when helper.Detail is "memcpy" or "memmove" or "memset" => new([X(1), X(2), X(8)], [X(0)], "Win64-CRT-memory"),
+        HelperKind.Import when MathImportSignature.Find(helper.Detail) is { } math =>
+            new(Enumerable.Range(0, math.Parameters.Length).Select(i => math.IsInteger(i) ? X(i == 0 ? 1 : 2) : Storage.Vec(i)).ToArray(),
+                [Storage.Vec(0)], "Win64-UCRT-math"),
+        _ => null,
+    };
 
     public IReadOnlyList<Storage> Reads(Call call) => Of(call)?.Reads ?? conservative.Reads(call);
 
     public IReadOnlyList<Storage> Results(Call call) =>
         call.Kind is CallKind.Tail or CallKind.TailIndirect ? [] : Of(call)?.Results ?? conservative.Results(call);
 
-    public IReadOnlyList<Storage> Clobbers(Call call) => convention.Clobbered;
+    public IReadOnlyList<Storage> Clobbers(Call call) => call.Op?.Kind == OpKind.MemoryBarrier ? [] : convention.Clobbered;
 }

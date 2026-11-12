@@ -11,6 +11,16 @@ internal static class DirectPass
         if (state.owner.HelperOf(call) is not { } helper)
             return null;
         var args = call.Arguments;
+        if (helper.Kind == HelperKind.Import && helper.Detail == "_CxxThrowException")
+        {
+            if (args.Length != 2 || state.defs.Expand(args[1]) is not Const info
+                || !Cpp2CS.Image.WindowsExceptionObjectProof.IsWrapperType(state.facts.Model.Image, info.Value)) return null;
+            state.Result.Hit(Template.HelperCall);
+            return call with { Op = new(OpKind.Rethrow, null), Arguments = [new Load(args[0], 64)], Sources = [], Results = [], Defines = [], StackPointer = null };
+        }
+        if (helper.Kind == HelperKind.FieldAddress && state.facts.Model.Image.Architecture == Architecture.X64
+            && (args.Length != 2 || state.defs.Expand(args[1]) is Symbol { Kind: SymbolKind.Field, Value: FieldRef { Field.IsStatic: true } }
+                || !FieldAddressUse(state, block, index, call))) return null;
         // 泛型虚方法：helper(vtable/接口槽的 method, m)，m 为封闭泛型方法；接口槽须匹配声明类型和槽号。
         if (args.Length >= 2 && state.defs.Expand(args[1]) is Symbol { Kind: SymbolKind.Method, Value: MethodRef generic } && generic.MethodArguments.Count > 0 && state.GenericVirtualSlot(state.defs.Expand(args[0]), generic) && call.Defines.FirstOrDefault() is { } resolved)
         {
@@ -28,13 +38,19 @@ internal static class DirectPass
         {
             state.Result.InitializedSlots.Add(slotAddress.Value);
             state.Result.Hit(Template.LazyMetadataInit);
-            state.lazyValues.Add((call, new Symbol(SymbolOfPass.SymbolOf(slot.Usage.Kind), slot.Usage.Value)));
+            state.lazyValues.Add((call, slotAddress.Value, new Symbol(SymbolOfPass.SymbolOf(slot.Usage.Kind), slot.Usage.Value)));
             return null;
         }
 
         Expr Arg(int i) => i < args.Length ? args[i] : Expr.C(0, 64);
         (OpKind Kind, object? Operand, Expr[] Arguments)? op = helper.Kind switch
         {
+            HelperKind.InterfaceLookup when state.facts.Model.Image.Architecture == Architecture.X64 && args.Length == 3
+                && state.defs.Expand(Arg(1)) is Symbol { Kind: SymbolKind.Class, Value: DefinitionRef { Definition.IsInterface: true } iface }
+                && Fold.Convert(ConvKind.Truncate, state.defs.Expand(Arg(2)), 16) is Const interfaceSlot
+                && call.Defines is [var data] && state.All.OfType<Call>().Any(c => c.Kind is CallKind.Indirect or CallKind.TailIndirect
+                    && state.defs.Expand(c.Target) is Load { Width: 64, Address: Use use } && use.Variable == data)
+                => (OpKind.InterfaceInvokeData, ((object?)iface, (int)interfaceSlot.Value), [Arg(0), Arg(1), interfaceSlot]),
             HelperKind.ObjectNew => (OpKind.NewObject, state.ClassOperand([Arg(0)]), [Arg(0)]),
             HelperKind.NewArray or HelperKind.NewArrayFull => (OpKind.NewArray, state.ClassOperand([Arg(0)]), [Arg(0), Arg(1)]),
             HelperKind.Box => (OpKind.Box, state.ClassOperand([Arg(0)]), [Arg(0), Arg(1)]),
@@ -46,7 +62,7 @@ internal static class DirectPass
             HelperKind.ClassInit => (OpKind.RunClassConstructor, state.ClassOperand([Arg(0)]), [Arg(0)]),
             HelperKind.InitializedTypeInfo => (OpKind.InitClass, state.ClassOperand([Arg(0)]), [Arg(0)]),
             HelperKind.InitMethodRgctx => (OpKind.InitMethodRgctx, null, [Arg(0)]),
-            HelperKind.Raise => (OpKind.Throw, null, [Arg(0)]),
+            HelperKind.Raise or HelperKind.CodegenRaise => (OpKind.Throw, null, [Arg(0)]),
             HelperKind.Throw => (OpKind.ThrowNew, helper.Detail, []),
             HelperKind.NullCheck => (OpKind.NullCheck, null, [Arg(0)]),
             HelperKind.GetException => (OpKind.NewException, helper.Detail, []),
@@ -63,6 +79,7 @@ internal static class DirectPass
             HelperKind.Import when helper.Detail == "__cxa_begin_catch" => (OpKind.BeginCatch, null, [Arg(0)]),
             HelperKind.Import when helper.Detail == "__cxa_end_catch" => (OpKind.EndCatch, null, []),
             HelperKind.Import => (OpKind.Import, helper.Detail, args),
+            HelperKind.GcNotification when args.Length == 1 => (OpKind.WriteBarrier, null, args),
             HelperKind.WriteBarrier when state.facts.Helpers.IsNotificationOnlyBarrier(helper.Address)
                 || state.PrecedingStore(block, index, Arg(0), Arg(1))
                 || state.UnchangedReference(block, index, Arg(0), Arg(1)) => (OpKind.WriteBarrier, null, [Arg(0), Arg(1)]),
@@ -72,7 +89,7 @@ internal static class DirectPass
             return null;
         state.Result.Hit(helper.Kind switch
         {
-            HelperKind.WriteBarrier => Template.WriteBarrier,
+            HelperKind.WriteBarrier or HelperKind.GcNotification => Template.WriteBarrier,
             HelperKind.Import => Template.ImportCall,
             _ => Template.HelperCall,
         });
@@ -84,6 +101,29 @@ internal static class DirectPass
             StackPointer = state.owner.calls.Signature(helper.Address) is { } native
                 && native.Reads.All(r => r.Bank != Bank.Stack) ? null : call.StackPointer,
         };
+    }
+
+    /// <summary>原生地址计算不检查空对象；只有已知栈存储或紧随的实际读取才能转成托管字段地址。</summary>
+    private static bool FieldAddressUse(IdiomState state, Block block, int index, Call call)
+    {
+        if (call.Arguments.Length != 2) return false;
+        if (state.defs.Expand(call.Arguments[0]) is FrameAddress or StackAllocation) return true;
+        if (call.Defines is not [var result]) return false;
+        for (var i = index + 1; i < block.Statements.Count; i++)
+        {
+            if (block.Statements[i] is Nop) continue;
+            if (block.Statements[i] is not Define define) return false;
+            var nodes = ExprMap.Walk(define.Value).ToArray();
+            // 条件读取及未知操作不能提前到地址计算处。
+            if (nodes.Any(e => e is Select or Intrinsic or Unknown)) return false;
+            var reads = nodes.OfType<Load>().ToArray();
+            if (reads.Length > 0) return reads.All(l => state.defs.Expand(l.Address) == new Use(result, 64));
+            // 只跳过不会抛出或访问内存的计算，保留实际读取相对其他效果的顺序。
+            if (nodes.Any(e => e is Cpp2CS.Ir.Convert { Kind: not (ConvKind.ZeroExtend or ConvKind.SignExtend or ConvKind.Truncate or ConvKind.Bitcast) }
+                || e is Binary { Op: not (BinOp.Add or BinOp.Sub or BinOp.Mul or BinOp.And or BinOp.Or or BinOp.Xor or BinOp.Shl or BinOp.LShr or BinOp.AShr or BinOp.Ror) }
+                || e is not (Const or Use or Read or FrameAddress or Symbol or Binary or Cpp2CS.Ir.Convert or Extract or Insert or Compare or Not or Logical))) return false;
+        }
+        return false;
     }
 
     // 原生地址相加使用 x1，边界比较使用 w1；仅在高位来自 32 位扩展时共享托管下标。

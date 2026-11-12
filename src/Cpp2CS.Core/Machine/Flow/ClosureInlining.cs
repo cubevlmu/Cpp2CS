@@ -14,12 +14,11 @@ using Storage = Cpp2CS.Ir.Storage;
 /// codegen 头文件里的内联成员函数（Array::SetAt、ArrayElementTypeCheck）clang 不内联时同样成为没有元数据的函数，
 /// 展开方式相同；展开之后与内联的形式一致，由 L2 按运行时操作恢复。
 /// </summary>
-internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosure, Func<ulong, bool> isOutlined, Storage firstArgument, Storage stackPointer, Storage framePointer, IReadOnlySet<Storage> preserved)
+internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosure, Func<ulong, bool> isOutlined, Storage firstArgument, Storage stackPointer, Storage framePointer, IReadOnlySet<Storage> preserved,
+    bool nativeCallStack = false, int maxDepth = 3, int maxBlocks = 4096)
 {
     /// <summary>展开产生的块用这个标记位的合成地址，不与代码地址和路径复制的合成地址相交。</summary>
     private const ulong Synthetic = 1UL << 62;
-    private const int MaxDepth = 3;
-    private const int MaxBlocks = 4096;
 
     /// <summary>提升器只用低编号的临时存储，且只在单条指令内部使用。</summary>
     private const int FirstTemporary = 1024;
@@ -29,6 +28,9 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
 
     public void Run(MachineFunction function)
     {
+        temporaries = Math.Max(FirstTemporary, function.Blocks.SelectMany(b => b.Statements).OfType<Assign>()
+            .Where(a => a.Target.Bank == Bank.Temp).Select(a => a.Target.Index + 1).DefaultIfEmpty(0).Max());
+        next = Math.Max(next, function.Blocks.Where(b => b.Start >> 62 == 1).Select(b => (b.Start ^ Synthetic) + 1).DefaultIfEmpty(0UL).Max());
         var depth = new Dictionary<Block, int>();
         var added = 0;
         var changed = false;
@@ -36,7 +38,7 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
         while (work.TryPop(out var block))
         {
             var level = depth.GetValueOrDefault(block);
-            if (level >= MaxDepth || added >= MaxBlocks) continue;
+            if (level >= maxDepth || added >= maxBlocks || nativeCallStack && (block.Handler is not null || block.IsLandingPad)) continue;
             bool Candidate(Stmt statement) => statement is Call { Kind: CallKind.Direct, DoesNotReturn: false, Target: Const target }
                 && target.Value != function.Entry && (isOutlined(target.Value) || isClosure(target.Value));
             var index = block.Statements.FindIndex(Candidate);
@@ -45,9 +47,19 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
             if (index < 0) continue;
             var call = (Call)block.Statements[index];
             var callee = cfg.Build(((Const)call.Target).Value);
-            if (callee.Problems.Count > 0) continue;
-            var (blocks, continuation) = Inline(block, index, callee);
-            added += blocks.Count;
+            if (callee.Problems.Count > 0 || nativeCallStack && added + callee.Blocks.Count + 1 > maxBlocks) continue;
+            var returnAddress = 0UL;
+            if (nativeCallStack)
+            {
+                var decoded = new List<Stmt>();
+                var size = cfg.Machine.Lift(call.Address, decoded);
+                if (size <= 0 || decoded.LastOrDefault() is not Call { Kind: CallKind.Direct } original || original.Target != call.Target) continue;
+                returnAddress = call.Address + (ulong)size;
+            }
+            var (blocks, continuation) = Inline(block, index, callee, returnAddress);
+            function.NativeExpansions.Add(new(cfg.Functions.At(call.Address)?.Start ?? function.Entry, call.Address, callee.Entry,
+                nativeCallStack ? "native-body" : "closure-or-outlined"));
+            added += blocks.Count + (nativeCallStack ? 1 : 0);
             changed = true;
             function.Blocks.AddRange(blocks);
             function.Blocks.Add(continuation);
@@ -98,7 +110,7 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
     }
 
     /// <summary>把 block 中 index 处的调用换成 callee 的一份副本。返回新块与调用之后的续接块。</summary>
-    private (List<Block> Blocks, Block Continuation) Inline(Block block, int index, MachineFunction callee)
+    private (List<Block> Blocks, Block Continuation) Inline(Block block, int index, MachineFunction callee, ulong returnAddress)
     {
         var call = (Call)block.Statements[index];
         var handler = block.Handler;
@@ -116,15 +128,25 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
         block.Successors.Clear();
         block.Statements.RemoveRange(index, block.Statements.Count - index);
 
-        // 副本写的 SP 和被调用者保存寄存器换成专属存储，入口时取调用方的值。
-        var renamed = callee.Blocks.SelectMany(b => b.Statements).OfType<Assign>().Select(a => a.Target).Where(t => t == stackPointer || preserved.Contains(t))
-            .Distinct().ToDictionary(t => t, _ => Storage.Temp(temporaries++));
-        foreach (var (register, temporary) in renamed) block.Statements.Add(new Assign(call.Address, temporary, new Read(register, register.Width)));
+        // x64 保留真实寄存器及保存/恢复访存，补回 Call 抽象省去的返回地址入栈。
+        // ARM64 闭包沿用专属 SP/非易失寄存器，以处理异常离开时的恢复。
+        var renamed = callee.Blocks.SelectMany(b => b.Statements).OfType<Assign>().Select(a => a.Target)
+            .Where(t => nativeCallStack ? t.Bank == Bank.Temp && t.Index >= 1000 : t == stackPointer || preserved.Contains(t))
+            .Distinct().ToDictionary(t => t, t => new Storage(Bank.Temp, temporaries++, t.Width));
+        if (nativeCallStack)
+        {
+            block.Statements.Add(new Assign(call.Address, stackPointer, new Binary(BinOp.Sub, new Read(stackPointer, 64), Expr.C(8, 64), 64)));
+            block.Statements.Add(new Store(call.Address, new Read(stackPointer, 64), Expr.C(returnAddress, 64)));
+        }
+        else foreach (var (register, temporary) in renamed)
+            block.Statements.Add(new Assign(call.Address, temporary, new Read(register, register.Width)));
         var movesStack = renamed.TryGetValue(stackPointer, out var stack);
         Stmt Rename(Stmt statement)
         {
             var mapped = renamed.Count == 0 ? statement : ExprMap.MapOperands(statement, e => ExprMap.Map(e, v => v is Read read && renamed.TryGetValue(read.Storage, out var temporary) ? new Read(temporary, read.Width) : null));
-            return mapped is Assign assign && renamed.TryGetValue(assign.Target, out var target) ? assign with { Target = target } : mapped with { };
+            if (mapped is not Assign assign) return mapped with { };
+            return assign with { Target = renamed.GetValueOrDefault(assign.Target, assign.Target),
+                PreserveRead = assign.PreserveRead || nativeCallStack && ExprMap.Walk(assign.Value).Any(e => e is Load) };
         }
         Call Copied(Call original)
         {
@@ -155,11 +177,16 @@ internal sealed class ClosureInlining(CfgBuilder cfg, Func<ulong, bool> isClosur
                             .FirstOrDefault(a => a.Kind == "typed-catch")?.Filter ?? 0;
                         current.Statements.Add(Rename(selector with { Value = Expr.C(unchecked((ulong)filter), selector.Value.Width) }));
                         break;
-                    case Return:
+                    case Return returned:
+                        if (nativeCallStack) current.Statements.Add(new Assign(returned.Address, stackPointer,
+                            new Binary(BinOp.Add, new Read(stackPointer, 64), Expr.C(8, 64), 64)));
                         Link(current, continuation);
                         break;
                     case Call { Kind: CallKind.Tail or CallKind.TailIndirect } tail:
                         // 尾调用返回到被调函数的调用者，也就是这里的续接点。
+                        // x64 的普通 Call 抽象以入栈前 SP 寻址实参，先越过原有返回地址。
+                        if (nativeCallStack) current.Statements.Add(new Assign(tail.Address, stackPointer,
+                            new Binary(BinOp.Add, new Read(stackPointer, 64), Expr.C(8, 64), 64)));
                         current = Called(current, Copied(tail) with { Kind = tail.Kind == CallKind.Tail ? CallKind.Direct : CallKind.Indirect }, thrown, created);
                         Link(current, continuation);
                         break;

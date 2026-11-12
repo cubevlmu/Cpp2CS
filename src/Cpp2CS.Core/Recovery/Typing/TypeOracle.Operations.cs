@@ -18,6 +18,9 @@ public sealed partial class TypeOracle
         {
             case OperatorKind.Compare:
                 var hint = TypeOf(op.Args[0]) ?? TypeOf(op.Args[1]);
+                // 判空的零常量没有整数类型优先权；引用身份来自另一操作数的已有类型证据。
+                if (SymTable.IsZero(op.Args[0]) && TypeOf(op.Args[1]) is { } rightReference && ManagedTypes.IsReferenceType(rightReference)) hint = rightReference;
+                if (SymTable.IsZero(op.Args[1]) && TypeOf(op.Args[0]) is { } leftReference && ManagedTypes.IsReferenceType(leftReference)) hint = leftReference;
                 if (hint is not null && types.Kind(hint) == TypeKind.Struct && op.Args[1].Width == op.Args[0].Width
                     && types.Size(hint) * 8 == op.Args[0].Width && Innermost(hint).Type is var scalar
                     && (types.Kind(scalar) is TypeKind.Int or TypeKind.Bool || ManagedTypes.IsReferenceType(scalar))) hint = scalar;
@@ -81,6 +84,7 @@ public sealed partial class TypeOracle
     {
         content = SymTable.Resolve(content);
         if (!seen.Add(content) || content is UndefSym) return true;
+        if (content is ConstSym { Value: <= 1 } && types.Kind(type) == TypeKind.Bool) return true;
         if (content is PhiSym { Projection: null } phi) return phi.Sources.All(s => s is null || Interpretable(s, type, seen));
         return TypeOf(content) is { } actual && (actual.Equals(type) || types.IsAssignable(actual, type));
     }

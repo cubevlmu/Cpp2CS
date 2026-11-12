@@ -19,7 +19,7 @@ internal sealed class MethodEnvironment(MethodRef method, MachineSignature signa
 
     public CallShape Shape(Call call)
     {
-        if (!calls.TryGetValue(call, out var shape)) calls[call] = shape = shapes.Of(call);
+        if (!calls.TryGetValue(call, out var shape)) calls[call] = shape = shapes.Of(call, method);
         return shape;
     }
 
@@ -76,8 +76,9 @@ internal sealed class MethodEnvironment(MethodRef method, MachineSignature signa
             OpSym { Op.Kind: OperatorKind.Binary, Args: [EntitySym e, ConstSym c] } add when add.Op.Binary == BinOp.Add => (e, c.Signed),
             _ => (null, 0L),
         };
-        if (entity is not { Symbol: { Kind: SymbolKind.Class, Value: DefinitionRef owner } } || offset < RuntimeLayout.ClassVtable) return null;
-        var within = offset - RuntimeLayout.ClassVtable;
+        var vtable = shapes.Facts.Model.Image.Architecture == Architecture.Arm64 ? RuntimeLayout.ClassVtable : shapes.Facts.Base.RuntimeOffsets?.ClassVtable;
+        if (vtable is null || entity is not { Symbol: { Kind: SymbolKind.Class, Value: DefinitionRef owner } } || offset < vtable) return null;
+        var within = offset - vtable.Value;
         if (within % RuntimeLayout.VirtualInvokeDataSize is not (0 or 8)) return null;
         return DispatchResolution.Slot(owner, (int)(within / RuntimeLayout.VirtualInvokeDataSize), interfaceOnly: false) is { } method
             ? syms.Entity(new Symbol(SymbolKind.Method, method)) : null;
@@ -93,9 +94,15 @@ internal sealed class MethodEnvironment(MethodRef method, MachineSignature signa
             foreach (var value in signature.Arguments)
                 foreach (var piece in value.Pieces.Where(p => p.Register.Bank == Bank.Stack))
                 {
-                    Sym content = value.Transfer == Transfer.Value
-                        ? syms.Slice(syms.Arg(value.Index, ValueWidth(value)), piece.Offset * 8, piece.Width)
-                        : syms.Local(LocalSpace.Copy(value.Index), 0);
+                    // 栈槽装的是 ABI 载体；ref 保留调用者位置，只有按值副本才属于局部空间。
+                    Sym content = value.Transfer switch
+                    {
+                        Transfer.Value => syms.Slice(syms.Arg(value.Index, ValueWidth(value)), piece.Offset * 8, piece.Width),
+                        Transfer.Reference => syms.Arg(value.Index, 64),
+                        Transfer.Copy => syms.Local(LocalSpace.Copy(value.Index), 0),
+                        Transfer.ResultBuffer => syms.Local(LocalSpace.Result, 0),
+                        _ => syms.Undef(piece.Width),
+                    };
                     for (var b = 0; b < content.Width / 8; b++)
                     {
                         var at = piece.Register.Index + b - cell.Start;

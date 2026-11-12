@@ -7,11 +7,14 @@ public sealed partial class ManagedTypes
 {
     private readonly ConcurrentDictionary<string, MethodRef> mathImports = new();
 
-    /// <summary>按已有 libm 依赖和 C 签名建立精确导入，保留原入口的浮点舍入语义。</summary>
+    /// <summary>按目标平台的 C 数学库和签名建立精确导入，保留原入口的浮点舍入语义。</summary>
     public MethodRef? MathImport(string? symbol)
     {
-        if (MathImportSignature.Find(symbol) is not { } signature
-            || Model.Image.NeededLibraries.Where(n => n is "libm.so" or "libm.so.6").ToArray() is not [var library]) return null;
+        if (MathImportSignature.Find(symbol) is not { } signature) return null;
+        var libraries = Model.Image.NeededLibraries.Where(n => n is "libm.so" or "libm.so.6").ToArray();
+        var library = Model.Image.Architecture == Architecture.X64 ? "ucrtbase.dll"
+            : libraries is [var native] ? native : null;
+        if (library is null) return null;
         return mathImports.GetOrAdd(symbol!, name =>
         {
             var owner = new TypeDef

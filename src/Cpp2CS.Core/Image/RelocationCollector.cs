@@ -8,6 +8,7 @@ internal sealed class RelocationCollector(ImageReader reader, List<ImageRange> r
     private readonly ImageRange[] executable = ranges.Where(r => r.Executable).ToArray();
     public List<RelocationTableSummary> Summaries { get; } = [];
     public List<CodeRelocation> CodeRelocations { get; } = [];
+    public List<CodeRelocation> AllRelocations { get; } = [];
     /// <summary>RELATIVE 重定位：目标地址处指针的加载后值（基址 0）。</summary>
     public Dictionary<ulong, ulong> Pointers { get; } = new();
     /// <summary>ABS64/GLOB_DAT/JUMP_SLOT：目标地址处指针引用的动态符号与加数，待符号表解析。</summary>
@@ -131,6 +132,7 @@ internal sealed class RelocationCollector(ImageReader reader, List<ImageRange> r
         if (!ranges.Any(r => address >= r.Address && address - r.Address < r.MemorySize && (ulong)size <= r.MemorySize - (address - r.Address)))
             throw new InvalidDataException($"重定位目标不在完整映像范围内：0x{address:X}+{size}");
         Increment(kinds, kind);
+        AllRelocations.Add(new(address, size, kind, position));
         if (executable.Any(r => address < checked(r.Address + r.MemorySize) && end > r.Address))
             CodeRelocations.Add(new(address, size, kind, position));
     }

@@ -17,12 +17,15 @@ public abstract record Stmt(ulong Address);
 /// 需要保留高位的写入（x64 8/16 位写、SSE 标量写）由提升器显式构造 Insert 表达式。</summary>
 public sealed record Assign(ulong Address, Storage Target, Expr Value) : Stmt(Address)
 {
+    /// <summary>展开调用中的原生读取必须保留求值，直到证明可安全归一或完成托管下降。</summary>
+    public bool PreserveRead { get; init; }
     public override string ToString() => $"{Target} = {Value}";
 }
 
 /// <summary>SSA 形式的定义。</summary>
 public sealed record Define(ulong Address, Variable Target, Expr Value) : Stmt(Address)
 {
+    public bool PreserveRead { get; init; }
     public override string ToString() => $"{Target} = {Value}";
 }
 
@@ -217,7 +220,7 @@ public sealed record Return(ulong Address) : Stmt(Address)
         : Value is null ? "return" : $"return {Value}";
 }
 
-/// <summary>不返回的陷入（brk/ud2/int3）。</summary>
+/// <summary>机器陷阱（brk/ud2/int3）；是否可由异常处理恢复需另行证明。</summary>
 public sealed record Trap(ulong Address, string Kind) : Stmt(Address)
 {
     public override string ToString() => $"trap {Kind}";

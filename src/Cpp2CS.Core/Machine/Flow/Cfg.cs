@@ -31,6 +31,9 @@ public sealed class Block
     public override string ToString() => $"B{Index}@0x{Start:x}";
 }
 
+/// <summary>展开点的物理来源，与根方法的托管身份分别记录。</summary>
+public sealed record NativeExpansion(ulong Caller, ulong CallSite, ulong Inlinee, string Mode);
+
 /// <summary>一个函数的控制流图。Blocks 按逆后序排列，Blocks[0] 为入口。</summary>
 public sealed class MachineFunction
 {
@@ -38,6 +41,8 @@ public sealed class MachineFunction
     public required CodeFunction Range { get; init; }
     public required List<Block> Blocks { get; set; }
     public List<string> Problems { get; } = [];
+    /// <summary>原生展开保留物理调用来源；同一 inlinee 的不同调用点分别记录。</summary>
+    public List<NativeExpansion> NativeExpansions { get; } = [];
     /// <summary>无法解析为跳转表、按尾调用处理的寄存器间接跳转数（推测）。</summary>
     public int UnresolvedIndirectJumps { get; internal set; }
     public int JumpTables { get; internal set; }
@@ -67,6 +72,7 @@ public sealed class MachineFunction
             JumpTables = JumpTables, UnresolvedIndirectJumps = UnresolvedIndirectJumps };
         result.Dead.AddRange(Dead.Select(d => (blocks[d.Block], d.Define)));
         result.Problems.AddRange(Problems);
+        result.NativeExpansions.AddRange(NativeExpansions);
         return result;
 
         Call CopyCall(Call call)
@@ -184,7 +190,27 @@ public sealed class CfgBuilder
         return Build(entry, range);
     }
 
-    public MachineFunction Build(ulong entry, CodeFunction range) => new Exploration(this, entry, range).Run();
+    private readonly Dictionary<ulong, (WindowsEhPlan? Plan, string Reason)> windowsPlans = new();
+    private readonly HashSet<ulong> activeWindowsPlans = [];
+    private (WindowsEhPlan? Plan, string Reason) WindowsPlan(CodeFunction range)
+    {
+        if (windowsPlans.TryGetValue(range.Start, out var known)) return known;
+        if (!activeWindowsPlans.Add(range.Start)) return (null, "fh4-recursive-cleanup-plan");
+        var plan = WindowsEhPlan.Create(this, range, out var reason);
+        activeWindowsPlans.Remove(range.Start);
+        return windowsPlans[range.Start] = (plan, reason);
+    }
+    public string? WindowsExceptionProblem(ulong entry)
+    {
+        if (functions.At(entry) is not { HasUnmodeledExceptions: true } range) return null;
+        var result = WindowsPlan(range);
+        return result.Plan is null ? "Windows EH：" + result.Reason : null;
+    }
+    public MachineFunction Build(ulong entry, CodeFunction range)
+    {
+        var plan = machine.Architecture == Architecture.X64 && range.HasUnmodeledExceptions ? WindowsPlan(range).Plan : null;
+        return new Exploration(this, entry, plan?.Range ?? range, plan).Run();
+    }
 
     private sealed class Insn(ulong address, int size, List<Stmt> statements)
     {
@@ -198,7 +224,7 @@ public sealed class CfgBuilder
         public ulong Next => Address + (ulong)Size;
     }
 
-    private sealed class Exploration(CfgBuilder owner, ulong entry, CodeFunction range)
+    private sealed class Exploration(CfgBuilder owner, ulong entry, CodeFunction range, WindowsEhPlan? windows = null)
     {
         private readonly Dictionary<ulong, Insn> insns = new();
         private readonly HashSet<ulong> leaders = [];
@@ -219,6 +245,7 @@ public sealed class CfgBuilder
         public MachineFunction Run()
         {
             var roots = new List<ulong> { entry };
+            if (windows is not null) roots.AddRange(windows.Roots.Where(r => r != entry));
             foreach (var region in range.ExceptionRegions)
                 if (region.LandingPad != 0 && InRange(region.LandingPad) && !roots.Contains(region.LandingPad)) roots.Add(region.LandingPad);
             foreach (var root in roots)
@@ -267,7 +294,14 @@ public sealed class CfgBuilder
                 if (size == 0)
                 {
                     problems.Add($"0x{address:x} 不可读");
+                    problems.AddRange(statements.OfType<Opaque>().Select(o => $"0x{o.Address:x}: {o.Text}"));
                     insns[address] = new Insn(address, 0, [new Trap(address, "unreadable")]) { Ends = true };
+                    continue;
+                }
+                if (owner.machine.Architecture == Architecture.X64 && (ulong)size > range.End - address)
+                {
+                    problems.Add($"0x{address:x} 指令跨越函数边界");
+                    insns[address] = new Insn(address, size, [new Trap(address, "instruction-crosses-boundary")]) { Ends = true };
                     continue;
                 }
                 var insn = new Insn(address, size, statements);
@@ -279,7 +313,7 @@ public sealed class CfgBuilder
                     {
                         insn.FallsThrough = false;
                         insn.Ends = true;
-                        if (insn.IsCall && statements[^1] is Call { Kind: CallKind.Direct, Target: Const callee } terminalCall)
+                        if (owner.machine.Architecture != Architecture.X64 && insn.IsCall && statements[^1] is Call { Kind: CallKind.Direct, Target: Const callee } terminalCall)
                         {
                             owner.NoReturn.AddEvidence(callee.Value);
                             statements[^1] = terminalCall with { DoesNotReturn = true };
@@ -305,6 +339,10 @@ public sealed class CfgBuilder
             var statements = insn.Statements;
             switch (statements.LastOrDefault())
             {
+                case Opaque when owner.machine.Architecture == Architecture.X64:
+                    // 未知指令的后继也未知，停止探索并由提升阶段报告原始诊断。
+                    insn.Ends = true;
+                    break;
                 case Jump jump when InRange(jump.Target):
                     insn.Targets = [jump.Target];
                     insn.Ends = true;
@@ -434,6 +472,7 @@ public sealed class CfgBuilder
             function.Problems.AddRange(problems);
             function.UnresolvedIndirectJumps = unresolved;
             function.JumpTables = resolvedTables;
+            windows?.Attach(function, owner);
             var all = function.Blocks.ToList();
             function.Renumber();
             if (function.Blocks.Count != all.Count)

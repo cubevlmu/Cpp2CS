@@ -6,8 +6,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Image/Profiles/msvc-fh4-x64.json" LogicalName="Cpp2CS.Image.msvc-fh4-x64.json" />
     <InternalsVisibleTo Include="Cpp2CS.Input" />
     <InternalsVisibleTo Include="Cpp2CS.Tests" />
+    <InternalsVisibleTo Include="Cpp2CS.X64.Tests" />
   </ItemGroup>
 
 </Project>

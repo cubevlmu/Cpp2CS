@@ -8,11 +8,17 @@ namespace Cpp2CS.Recovery.Calls;
 
 /// <summary>按调用形状与运行时操作表回答调用对帧内存的影响；目标未确定时保守。</summary>
 /// <param name="settled">调用目标的解析已结束：仍未解析的调用只会成为洞，不再需要为它保留可能的栈实参。</param>
-internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi abi, bool settled = false) : IFrameCallEffects
+internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi abi, bool settled = false,
+    Func<Call, int, bool>? unusedSnapshot = null, Func<Call, int?>? runtimeStackRead = null) : IFrameCallEffects
 {
     public ArgumentUse Argument(Call call, int index)
     {
         var shape = shapes(call);
+        if (shape.NativeSummary is { } native && index >= call.Arguments.Length - call.Sources.Length && index < call.Arguments.Length)
+        {
+            var source = call.Sources[index - (call.Arguments.Length - call.Sources.Length)];
+            return native.Arguments.GetValueOrDefault(source, ArgumentUse.None);
+        }
         if (call.Op is { } op && shape.IsRuntime)
         {
             if (RuntimeOps.Of(op.Kind) is not { } rule) return ArgumentUse.Unknown;
@@ -22,6 +28,7 @@ internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi
             if (rule.Behavior.InvalidatesMemory) return ArgumentUse.Unknown;
             return (rule.Behavior.Kinds & EffectKind.Read) != 0 ? new(-1, MemoryAccess.Read, false) : ArgumentUse.None;
         }
+        if (unusedSnapshot?.Invoke(call, index) == true) return ArgumentUse.None;
         foreach (var value in shape.Signature?.Indirections ?? [])
             if (call.ArgumentIndex(value.Pieces[0].Register) == index) return new(value.Size, value.Access, false);
         // 按引用类型传递的栈地址只能是栈上临时对象：codegen 保证它只在这次调用期间存在，调用不改写它。
@@ -31,13 +38,15 @@ internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi
         return ArgumentUse.Unknown;
     }
 
-    public bool WritesEscaped(Call call) => call.Op is not { } op || !shapes(call).IsRuntime
+    public bool WritesEscaped(Call call) => shapes(call).NativeSummary is { } native ? native.WritesMemory
+        : call.Op is not { } op || !shapes(call).IsRuntime
         || RuntimeOps.Of(op.Kind)?.Behavior.InvalidatesMemory != false;
 
     public int? StackRead(Call call)
     {
         var shape = shapes(call);
+        if (shape.NativeSummary is not null) return 0;
         if (call.Op is { Kind: not (OpKind.Import or OpKind.Export) } && shape.IsRuntime) return 0;
-        return shape.Signature?.StackSize ?? (settled ? 0 : null);
+        return shape.Signature?.StackSize ?? runtimeStackRead?.Invoke(call) ?? (settled ? 0 : null);
     }
 }

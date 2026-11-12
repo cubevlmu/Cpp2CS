@@ -40,6 +40,13 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
         var operands = values.Operands(statement);
         switch (statement)
         {
+            case Define { PreserveRead: true }:
+                foreach (var read in values.ReadsAt(statement))
+                {
+                    materialized.Add(read);
+                    Read(read, statement);
+                }
+                break;
             case Store store:
                 if (oracle.StoreGroupOf(store) is { } group)
                 {
@@ -143,7 +150,7 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
         }
         if (location.Index is { } index)
         {
-            index = TypeOracle.ArrayIndex(index);
+            index = oracle.ArrayIndexValue(index);
             Use(index, index.Width == 32 ? Types.Int32 : Types.Int64, user);
         }
         if (location.ByteOffset is { } offset) Use(offset, Types.Int64, user);

@@ -181,9 +181,9 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
     public bool BoundsAbsorbed(Block block, int index, Sym position, Sym length)
     {
         if (LengthOf(length) is not { } array) return false;
-        var wanted = TypeOracle.ArrayIndex(position);
+        var wanted = oracle.ArrayIndexValue(position);
         bool Same(Sym address, int width) => oracle.Locate(address, width) is { Kind: LocationKind.Element } element && ReferenceEquals(SymTable.Resolve(element.Base!), array)
-            && (element.Index is { } at ? ReferenceEquals(TypeOracle.ArrayIndex(at), wanted) : wanted is ConstSym c && c.Value == (ulong)element.ConstantIndex);
+            && (element.Index is { } at ? ReferenceEquals(oracle.ArrayIndexValue(at), wanted) : wanted is ConstSym c && c.Value == (ulong)element.ConstantIndex);
         var nonNull = NonNull(block, index);
         nonNull.Add(array);
         foreach (var (statement, guarded) in Following(block, index))
@@ -224,7 +224,7 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
     /// </summary>
     private Sym? LengthOf(Sym length, HashSet<PhiSym>? visiting = null)
     {
-        switch (TypeOracle.ArrayIndex(length))
+        switch (oracle.ArrayIndexValue(length))
         {
             case ReadSym read when oracle.Locate(read.Address, read.Width) is { Kind: LocationKind.Length, Base: { } array }:
                 return SymTable.Resolve(array);

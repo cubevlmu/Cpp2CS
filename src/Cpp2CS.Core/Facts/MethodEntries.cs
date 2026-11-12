@@ -12,15 +12,18 @@ public sealed class MethodEntries
     private readonly Dictionary<(MethodRef Method, string Binding), ulong> addresses = [];
     private readonly Dictionary<MethodDef, NativeMethodEntry> definitions;
 
-    public MethodEntries(ProgramFacts facts, ManagedTypes types)
+    public MethodEntries(ProgramFacts facts, ManagedTypes types) : this(facts.Model, facts.Registrations, types) { }
+
+    /// <summary>入口选择不依赖代码扫描，使注册实例能在扫描范围确定前参与选择。</summary>
+    public MethodEntries(ProgramModel model, Registrations registrations, ManagedTypes types)
     {
         this.types = types;
-        foreach (var method in facts.Model.Methods.Where(m => m.Address != 0)) Add(new MethodRef(method, [], []), method.Address);
+        foreach (var method in model.Methods.Where(m => m.Address != 0)) Add(new MethodRef(method, [], []), method.Address);
         // 调整桩、调用器和反向包装具有不同 ABI，不能用作方法本体的恢复入口。
-        var implementations = facts.Registrations.Entries.Where(e => e.Kind is EntryKind.Method or EntryKind.GenericMethod
+        var implementations = registrations.Entries.Where(e => e.Kind is EntryKind.Method or EntryKind.GenericMethod
             && e.Method is not null && e.Address != 0).ToArray();
         foreach (var entry in implementations) Add(entry.Method!, entry.Address);
-        var ordinary = facts.Model.Methods.Where(m => m.Address != 0).Select(m => new NativeMethodEntry(new(m, [], []), m.Address));
+        var ordinary = model.Methods.Where(m => m.Address != 0).Select(m => new NativeMethodEntry(new(m, [], []), m.Address));
         var shared = implementations.Where(e => e.Kind == EntryKind.GenericMethod && e.Method!.Method.Address == 0)
             .Select(e => new NativeMethodEntry(e.Method!, e.Address));
         definitions = ordinary.Concat(shared).GroupBy(e => e.Instance.Method).ToDictionary(g => g.Key, SelectDefinition);

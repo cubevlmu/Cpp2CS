@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Cpp2CS.X64</RootNamespace>
+    <AssemblyName>Cpp2CS.X64</AssemblyName>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Cpp2CS.X64.Tests" />
+    <ProjectReference Include="../Cpp2CS.Core/Cpp2CS.Core.csproj" />
+  </ItemGroup>
+</Project>

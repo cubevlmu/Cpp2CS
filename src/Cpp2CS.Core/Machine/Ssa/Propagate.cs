@@ -18,7 +18,9 @@ public static class Propagate
         while (true)
         {
             var changed = Substitute(function, dominators);
+            changed |= PhiSlices.Run(function);
             changed |= EdgeConstants.Run(function) > 0;
+            changed |= FiniteConditions.PhiPredicates(function);
             if (!changed) break;
             RemoveDead(function);
         }
@@ -38,18 +40,26 @@ public static class Propagate
     private static bool Substitute(MachineFunction function, Dominators dominators)
     {
         var replace = new Dictionary<Variable, Expr>();
+        var fragments = new Dictionary<Variable, Expr>();
         var renamed = new Dictionary<Variable, Variable>();
         var definedIn = new Dictionary<Variable, int>();
+        var definitions = new Dictionary<Variable, Stmt>();
         foreach (var block in function.Blocks)
             foreach (var stmt in block.Statements)
                 foreach (var target in Targets(stmt))
+                {
                     definedIn[target] = block.Index;
+                    definitions[target] = stmt;
+                }
         // 来源 v 在 φ 所在块入口可用：入口值，或定义块严格支配该块
         bool Reaches(Variable v, int block) => v.Version == 0 || definedIn.TryGetValue(v, out var at) && at != block && dominators.Dominates(at, block);
 
         foreach (var block in function.Blocks)
             foreach (var stmt in block.Statements)
             {
+                // 部分寄存器写入只在被观察的位片内传播；完整值仍保留旧高位的依赖。
+                if (stmt is Define { Value: Insert } inserted
+                    && !ExprMap.Walk(inserted.Value).Any(e => e is Load or Intrinsic)) fragments[inserted.Target] = inserted.Value;
                 if (stmt is Define define && Movable(define.Value))
                 {
                     replace[define.Target] = define.Value;
@@ -73,7 +83,43 @@ public static class Propagate
                     }
                 }
             }
-        if (replace.Count == 0) return false;
+        if (replace.Count == 0 && fragments.Count == 0) return false;
+
+        var slices = new Dictionary<(Variable, int), Expr?>();
+        bool SnapshotsOnly(Expr value, IReadOnlySet<Variable> retained)
+        {
+            var pending = new Stack<Expr>();
+            var seen = new HashSet<Variable>();
+            pending.Push(value);
+            while (pending.TryPop(out var expression))
+                foreach (var node in ExprMap.Walk(expression))
+                {
+                    if (node is Load or Intrinsic) return false;
+                    // 投影仍使用的 SSA 快照保留其求值；只检查被丢弃的来源，不能因其含读取而阻止低位传播。
+                    if (node is not Use use || retained.Contains(use.Variable) || use.Variable.Version <= 0 || !seen.Add(use.Variable)) continue;
+                    if (seen.Count > 256 || !definitions.TryGetValue(use.Variable, out var statement)) return false;
+                    switch (statement)
+                    {
+                        case Define d: pending.Push(d.Value); break;
+                        case Phi phi:
+                            foreach (var source in phi.Sources) pending.Push(new Use(source, source.Width));
+                            break;
+                        // 调用本身始终保留；丢弃未观察的返回高位不会丢弃调用效果。
+                        case Call: break;
+                        default: return false;
+                    }
+                }
+            return true;
+        }
+        Expr? Fragment(Use use)
+        {
+            if (use.Width <= 0 || use.Width >= use.Variable.Width || !fragments.TryGetValue(use.Variable, out var definition)) return null;
+            var key = (use.Variable, use.Width);
+            if (slices.TryGetValue(key, out var known)) return known;
+            var value = Fold.Convert(ConvKind.Truncate, definition, use.Width);
+            var retained = ExprMap.Walk(value).OfType<Use>().Select(u => u.Variable).ToHashSet();
+            return slices[key] = Movable(value) && SnapshotsOnly(definition, retained) ? value : null;
+        }
 
         Variable Chase(Variable v)
         {
@@ -95,7 +141,8 @@ public static class Propagate
         }
         Expr Resolve(Expr expr) => Fold.Simplify(ExprMap.Map(expr, e =>
         {
-            if (e is not Use use || !replace.ContainsKey(use.Variable)) return null;
+            if (e is not Use use) return null;
+            if (!replace.ContainsKey(use.Variable)) return Fragment(use) is { } part ? Resolve(part) : null;
             var value = Value(use.Variable);
             return use.Width == value.Width ? value : Fold.Convert(ConvKind.Truncate, value, use.Width);
         }));
@@ -129,7 +176,7 @@ public static class Propagate
                 added = true;
             }
         }
-        bool Mentions(Expr expr) => ExprMap.Walk(expr).Any(e => e is Use u && replace.ContainsKey(u.Variable));
+        bool Mentions(Expr expr) => ExprMap.Walk(expr).Any(e => e is Use u && (replace.ContainsKey(u.Variable) || Fragment(u) is not null));
 
         var changed = false;
         foreach (var block in function.Blocks)
@@ -144,7 +191,12 @@ public static class Propagate
                     var sources = phi.Sources.Select(Chase).ToArray();
                     rewritten = sources.AsSpan().SequenceEqual(phi.Sources) ? phi : phi with { Sources = sources };
                 }
-                else if (stmt is Define define && replace.ContainsKey(define.Target)) continue;
+                else if (stmt is Define define && replace.ContainsKey(define.Target))
+                {
+                    // 窄 φ 的输入必须保留独立定义；先折叠其部分寄存器来源，不能只在普通使用处替换。
+                    if (!ExprMap.Walk(define.Value).OfType<Use>().Any(u => Fragment(u) is not null)) continue;
+                    rewritten = define with { Value = Resolve(define.Value) };
+                }
                 else rewritten = ExprMap.MapOperands(stmt, e => Mentions(e) ? Resolve(e) : e);
                 if (ReferenceEquals(rewritten, stmt)) continue;
                 statements[i] = rewritten;
@@ -172,7 +224,11 @@ public static class Propagate
         foreach (var block in function.Blocks)
             foreach (var stmt in block.Statements)
             {
-                if (stmt is Define d) definitions[d.Target] = stmt;
+                if (stmt is Define d)
+                {
+                    definitions[d.Target] = stmt;
+                    if (d.PreserveRead) work.Push(d.Target);
+                }
                 else if (stmt is Phi p) definitions[p.Target] = stmt;
                 else foreach (var input in Inputs(stmt)) work.Push(input);
             }

@@ -170,6 +170,8 @@ internal sealed partial class BodyBuilder
             case Transfer.Reference:
                 {
                     var element = type is ByRefRef byRef ? byRef.Element : type;
+                    if (oracle.AddressArm(content, new ByRefRef(element)) is { } addressed && WritableReferencePath(addressed.Path))
+                        return new AddressValue(LocationValue(addressed, call.Address, store: true));
                     // 不透明值没有固定位宽，只按位置定位。
                     var elementBits = ManagedAbi.SharedValue(element) ? -1 : types.Kind(element) == TypeKind.Struct ? types.Size(element) * 8 : Math.Max(8, Width(element));
                     if (SymTable.Resolve(content) is LocalSym escaped && analysis.Memory.Find(escaped.Space, escaped.Offset, 1) is { Promoted: false })

@@ -7,10 +7,13 @@ namespace Cpp2CS.Facts.Derived;
 /// <summary>按恢复器实例缓存的原生输入证明；递归中的结果保持未知。</summary>
 internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedInputs)
 {
-    private readonly ManagedAbi abi = new(facts.Layouts);
-    private readonly Cpp2CS.Machine.Lifting.FunctionLifter inputLifter = new(facts);
+    private readonly ManagedAbi abi = facts.CreateAbi();
+    private readonly Cpp2CS.Machine.Lifting.FunctionLifter inputLifter = new(facts) { InputDependenciesOnly = true };
     internal readonly Dictionary<ulong, HashSet<Storage>?> nativeInputs = new();
     internal readonly Dictionary<ulong, bool> unusedResultBuffers = new();
+    private int inputDepth;
+    private int nativeProofs;
+    private int x64Proofs;
 
     internal bool UnusedResultBuffer(ulong entry)
     {
@@ -31,27 +34,48 @@ internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedIn
     {
         if (!nativeInputs.TryGetValue(entry, out var reads))
         {
+            if (inputDepth >= 8) return false;
+            if (inputDepth == 0) { x64Proofs = 0; nativeProofs = 0; }
+            // Win64 证明只读取有界本体；未知和超预算保留实参，不递归普查整个依赖库。
+            if (facts.Model.Image.Architecture == Architecture.X64
+                && (x64Proofs >= 256 || facts.Code.At(entry) is not { Size: <= 8192 })) return false;
+            if (facts.Model.Image.Architecture == Architecture.X64) x64Proofs++;
             // 递归调用暂不证明未用；后续只缓存完整分析的结果。
             nativeInputs.Add(entry, null);
             var methods = facts.EntriesAt(entry).Select(e => e.Method).OfType<MethodRef>().ToArray();
             reads = null;
-            if (methods.Length > 0 && methods.All(m => (m.Method.Address == entry || m.Method.Address == 0)
+            var native = methods.Length == 0 && nativeProofs < 64
+                && facts.Code.At(entry) is { Size: <= 8192 } range && range.Start == entry
+                && (!range.HasUnmodeledExceptions || inputLifter.WindowsExceptionProblem(entry) is null);
+            if (native || methods.Length > 0 && methods.All(m => (m.Method.Address == entry || m.Method.Address == 0)
                 && !m.TypeArguments.Concat(m.MethodArguments).Any(FieldLayouts.IsFullyShared)))
             {
+                if (native) nativeProofs++;
                 var signatures = methods.Select(m => abi.Classify(m, out _)).ToArray();
                 if (signatures.All(s => s is not null))
                 {
                     // 同地址的多个所有者取返回寄存器并集，不能把另一签名的返回输入误判为未用。
-                    var returned = signatures.SelectMany(s => s!.Return?.Pieces ?? []).Distinct()
-                        .Select(p => (Expr)new Read(p.Register, p.Width)).ToArray();
+                    var returned = native ? inputLifter.Machine.Convention.IntegerResults.Concat(inputLifter.Machine.Convention.FloatResults)
+                        .Select(r => (Expr)new Read(r, r.Bank == Bank.Vec ? 128 : 64)).ToArray()
+                        : signatures.SelectMany(s => s!.Return?.Pieces ?? []).Distinct().Select(p => (Expr)new Read(p.Register, p.Width)).ToArray();
                     var lifted = inputLifter.Lift(entry, returned.Length == 0 ? null : new Intrinsic("return", returned, 64), simplify: false);
                     var delegates = recoverUnusedInputs ? DelegateCallNormalizer.InputReads(facts, lifted.Function) : [];
+                    var icalls = facts.NativeIcalls.Inputs(lifted.Function);
                     var interfaceTails = InterfaceTailProof.Find(lifted.Function, call => call is { Kind: CallKind.Direct or CallKind.Tail, Target: Const target } && facts.Code.RegionOf(target.Value) != CodeRegion.Managed && facts.Helpers.At(target.Value)?.Kind == HelperKind.InterfaceLookup);
                     // 委托尾跳转沿用完整布局与 Invoke ABI 证明；原始字段读取仍参与入口依赖分析。
+                    inputDepth++;
                     reads = Cpp2CS.Machine.Lifting.NativeInputs.Reads(lifted,
-                        recoverUnusedInputs ? (call, input) => delegates.TryGetValue(call, out var used) ? !used.Contains(input)
-                            : call is { Op: null, Kind: CallKind.Direct or CallKind.Tail, Target: Const target } && UnusedInput(target.Value, input) : null,
-                        call => delegates.ContainsKey(call) || interfaceTails.Contains(call));
+                        (call, input) => icalls.TryGetValue(call, out var bound) ? !bound.ContainsKey(input)
+                            : delegates.TryGetValue(call, out var used) ? !used.Contains(input)
+                            : call is { Op: null, Kind: CallKind.Direct or CallKind.Tail, Target: Const target }
+                                && (recoverUnusedInputs || facts.EntriesAt(target.Value).Length == 0) && UnusedInput(target.Value, input),
+                        call => icalls.ContainsKey(call) || delegates.ContainsKey(call) || interfaceTails.Contains(call),
+                        preserveAllReads: !recoverUnusedInputs && icalls.Count == 0,
+                        inputWidth: (call, input) => icalls.TryGetValue(call, out var bound) && bound.TryGetValue(input, out var width) ? width : null);
+                    if (facts.Options.Diagnostics.Typing.Contains(entry))
+                        facts.Options.Diagnostics.Write("native-inputs", entry,
+                            $"依赖图可检查：{lifted.Succeeded}；icall 调用绑定：{icalls.Count}；入口读取：{(reads is null ? "未证明" : string.Join(", ", reads))}");
+                    inputDepth--;
                 }
             }
             nativeInputs[entry] = reads;

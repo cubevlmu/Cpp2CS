@@ -34,6 +34,9 @@ internal sealed partial class BodyBuilder
 
     private int Width(TypeRef type) => types.ValueWidth(type);
 
+    private bool WritableReferencePath(IReadOnlyList<FieldRef> path) => path.All(f =>
+        (f.Field.Attributes & System.Reflection.FieldAttributes.InitOnly) == 0 && fields.Accessible(f, f.DeclaringType));
+
     private ManagedValue? Read(ReadSym read, ulong address)
     {
         if (oracle.Decompose(read.Address) is (ResultSym { Site: { Op.Kind: OpKind.BeginCatch } begin }, 0, null, _) && exceptions.TryGetValue(begin, out var exception))
@@ -101,7 +104,7 @@ internal sealed partial class BodyBuilder
     /// </summary>
     private ManagedValue ElementIndex(Sym index, ulong address)
     {
-        index = TypeOracle.ArrayIndex(index);
+        index = oracle.ArrayIndexValue(index);
         return index.Width == 32 ? View(index, types.Int32, address) : View(index, types.Int64, address);
     }
 

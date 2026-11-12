@@ -64,6 +64,12 @@ public sealed partial class ManagedTypes
     public DefinitionRef Corlib(string fullName) => new(corlib[fullName], []);
     public TypeDef? CorlibDefinition(string fullName) => corlib.GetValueOrDefault(fullName);
 
+    /// <summary>保留元数据中的受限值类型身份；装箱和堆数组不能承载这类值。</summary>
+    public static bool IsByRefLike(TypeRef type) => type is DefinitionRef { Definition.IsValueType: true } definition
+        && (definition.Definition.CustomAttributes.Any(a => a.Constructor.Owner.FullName == "System.Runtime.CompilerServices.IsByRefLikeAttribute")
+            || definition.Definition.Assembly is "mscorlib.dll" or "System.Private.CoreLib.dll"
+                && definition.Definition.FullName == "System.TypedReference");
+
     /// <summary>IL2CPP 共享实参：引用归为 object，枚举归为同底层类型的共享枚举，值类型实参递归处理。</summary>
     public TypeRef SharedGenericArgument(TypeRef type) => IsReferenceType(type) ? Object : type switch
     {

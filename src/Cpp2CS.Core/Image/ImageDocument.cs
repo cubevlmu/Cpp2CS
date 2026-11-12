@@ -8,7 +8,7 @@ public sealed record ImageRange(string Name, ulong Address, long FileOffset, ulo
 public enum AddressKind { FileBacked, ZeroFill, Unmapped }
 public sealed record AddressResolution(AddressKind Kind, ImageRange? Range, long? FileOffset, ulong AvailableBytes);
 public sealed record CodeRelocation(ulong Address, int Size, string Kind, long RecordFileOffset);
-/// <summary>节头表中的一节。Flags 为 ELF sh_flags（2 SHF_ALLOC，4 SHF_EXECINSTR）；PE 节以可执行位换算。</summary>
+/// <summary>节头表中的一节。Flags 为 ELF sh_flags（1 可写，2 已分配，4 可执行）；PE 节按属性换算。</summary>
 public sealed record ImageSection(string Name, ulong Address, ulong Size, uint Type, ulong Flags)
 {
     public bool Executable => (Flags & 4) != 0;
@@ -46,10 +46,17 @@ public sealed class ImageDocument
     /// <summary>重定位指针：(指针所在地址, 指针值)。</summary>
     public IEnumerable<KeyValuePair<ulong, ulong>> RelocatedPointers => pointerFixups;
 
-    /// <summary>引用未定义动态符号的指针位置（GOT、JUMP_SLOT）及符号名。</summary>
+    /// <summary>引用外部符号的指针位置（GOT、JUMP_SLOT、PE IAT）及符号名。</summary>
     public IReadOnlyDictionary<ulong, string> Imports { get; private init; } = new Dictionary<ulong, string>();
 
-    /// <summary>ELF DT_NEEDED 中声明的动态库名，不从导入符号名推测库名。</summary>
+    /// <summary>PE IAT 槽位所属 DLL；保留同名导入的来源。</summary>
+    public IReadOnlyDictionary<ulong, string> ImportModules { get; private init; } = new Dictionary<ulong, string>();
+
+    /// <summary>PE 加载器可能改写的范围，不得按文件初值折叠。</summary>
+    internal IReadOnlyList<(ulong Address, ulong Size)> LoaderWrites { get; private init; } = [];
+    internal bool HasUnmodeledLoaderWrites { get; private init; }
+
+    /// <summary>ELF DT_NEEDED 或 PE 导入描述符声明的库名，不从符号名推测。</summary>
     public IReadOnlyList<string> NeededLibraries { get; private init; } = [];
 
     /// <summary>按符号重定位的指针位置及符号名，含已定义符号（如静态链接并导出的 libc++abi 经 PLT 引用）。</summary>
@@ -413,6 +420,7 @@ public sealed class ImageDocument
             throw new InvalidDataException("PE 映像大小或对齐错误");
         _ = checked(imageBase + imageSize);
         var ranges = new List<ImageRange> { new("Headers", imageBase, 0, headersSize, headersSize, false) };
+        var sections = new List<ImageSection>();
         var sectionTable = checked(optional + optionalSize);
         reader.Require(sectionTable, checked((ulong)count * 40));
         if ((ulong)(sectionTable + count * 40L) > headersSize) throw new InvalidDataException("PE section table 超过 SizeOfHeaders");
@@ -430,6 +438,9 @@ public sealed class ImageDocument
             if (rva % sectionAlignment != 0 || (rawSize != 0 && rawOffset % fileAlignment != 0) || (ulong)rva + memorySize > imageSize)
                 throw new InvalidDataException($"PE section {name} 范围或对齐错误");
             ranges.Add(new(name, checked(imageBase + rva), rawOffset, Math.Min(rawSize, memorySize), memorySize, (reader.U32(s + 36) & 0x20000000) != 0));
+            var characteristics = reader.U32(s + 36);
+            sections.Add(new(name, checked(imageBase + rva), memorySize, 0,
+                2UL | ((characteristics & 0x20000000) != 0 ? 4UL : 0) | ((characteristics & 0x80000000) != 0 ? 1UL : 0)));
         }
         ValidateRanges(reader, ranges);
         var directoryCount = reader.U32(optional + 108);
@@ -448,12 +459,107 @@ public sealed class ImageDocument
         var exports = new Dictionary<string, ulong>(StringComparer.Ordinal);
         if (directoryCount > 0 && reader.U32(optional + 112) is var exportRva and not 0)
             ReadPeExports(reader, ranges, imageBase, exportRva, exports);
+        var imports = new Dictionary<ulong, string>();
+        var libraries = new List<string>();
+        var importModules = new Dictionary<ulong, string>();
+        var unmodeledLoaderWrites = false;
+        if (directoryCount > 1)
+        {
+            var importRva = reader.U32(optional + 120);
+            var importSize = reader.U32(optional + 124);
+            if ((importRva == 0) != (importSize == 0)) throw new InvalidDataException("PE import directory 地址/长度不一致");
+            if (importSize != 0) ReadPeImports(reader, ranges, imageBase, importRva, importSize, imports, importModules, libraries, out unmodeledLoaderWrites);
+        }
+        var loaderWrites = collector.AllRelocations.Select(r => (r.Address, Size: (ulong)r.Size)).ToList();
+        loaderWrites.AddRange(imports.Keys.Select(a => (a, 8UL)));
+        if (directoryCount > 12 && reader.U32(optional + 112 + 12 * 8) is var iatRva and not 0)
+            loaderWrites.Add((checked(imageBase + iatRva), reader.U32(optional + 116 + 12 * 8)));
+        if (directoryCount > 9 && reader.U32(optional + 112 + 9 * 8) is var tlsRva and not 0)
+        {
+            var tls = MapFile(ranges, checked(imageBase + tlsRva), 40);
+            if (reader.U64(tls + 16) is var indexAddress and not 0) loaderWrites.Add((indexAddress, 4));
+        }
+        // 运行时填写的函数指针槽与安全 cookie 不同于只读的 CFG/EH 描述表。
+        if (directoryCount > 10 && reader.U32(optional + 112 + 10 * 8) is var configRva and not 0)
+        {
+            var configSize = reader.U32(optional + 116 + 10 * 8);
+            if (configSize < 4) throw new InvalidDataException("PE Load Config 长度不足");
+            var config = MapFile(ranges, checked(imageBase + configRva), configSize);
+            var structureSize = reader.U32(config);
+            unmodeledLoaderWrites |= structureSize < 4 || structureSize > configSize;
+            var declared = Math.Min(configSize, structureSize);
+            foreach (var at in new[] { 88, 112, 120, 216, 232, 280, 288, 296, 304, 312 })
+                if (at + 8 <= declared && reader.U64(config + at) is var pointer and not 0) loaderWrites.Add((pointer, 8));
+            // VolatileMetadataPointer 描述模拟器的访问顺序，不指定加载器写入。
+            unmodeledLoaderWrites |= declared > 320
+                || new[] { 192, 200 }.Any(at => at + 8 <= declared && reader.U64(config + at) != 0)
+                || declared >= 230 && (reader.U32(config + 224) != 0 || reader.U16(config + 228) != 0);
+        }
         return new(reader.Bytes, Cpp2CS.Model.Architecture.X64, imageBase, ranges, collector.Summaries, collector.CodeRelocations)
         {
             ExceptionDirectory = exceptionDirectory,
-            Sections = ranges.Skip(1).Select(r => new ImageSection(r.Name, r.Address, r.MemorySize, 0, 2UL | (r.Executable ? 4UL : 0))).ToArray(),
+            Sections = sections.OrderBy(s => s.Address).ToArray(),
             Exports = exports,
+            Imports = imports,
+            ImportModules = importModules,
+            SymbolSlots = imports,
+            NeededLibraries = libraries,
+            LoaderWrites = loaderWrites.OrderBy(r => r.Item1).ToArray(),
+            HasUnmodeledLoaderWrites = unmodeledLoaderWrites || directoryCount > 13 && reader.U32(optional + 112 + 13 * 8) != 0,
         };
+    }
+
+    private static void ReadPeImports(ImageReader reader, List<ImageRange> ranges, ulong imageBase, uint rva, uint size,
+        Dictionary<ulong, string> imports, Dictionary<ulong, string> modules, List<string> libraries, out bool unmodeledWrites)
+    {
+        unmodeledWrites = false;
+        long Map(ulong relative, ulong length) => MapFile(ranges, checked(imageBase + relative), length);
+        string Name(ulong relative)
+        {
+            var address = checked(imageBase + relative);
+            var range = ranges.FirstOrDefault(r => address >= r.Address && address - r.Address < r.FileSize)
+                ?? throw new InvalidDataException("PE import 名称未映射");
+            var offset = Map(relative, 1);
+            return reader.String(offset, range.FileSize - (address - range.Address), 0);
+        }
+        var directory = Map(rva, size);
+        for (ulong pos = 0; pos + 20 <= size; pos += 20)
+        {
+            var descriptor = directory + (long)pos;
+            var lookup = reader.U32(descriptor);
+            var timestamp = reader.U32(descriptor + 4);
+            var forwarder = reader.U32(descriptor + 8);
+            var nameRva = reader.U32(descriptor + 12);
+            var iat = reader.U32(descriptor + 16);
+            if ((lookup | timestamp | forwarder | nameRva | iat) == 0) return;
+            if (nameRva == 0 || iat == 0) throw new InvalidDataException("PE import descriptor 缺少名称或 IAT");
+            var library = Name(nameRva);
+            if (!libraries.Contains(library, StringComparer.OrdinalIgnoreCase)) libraries.Add(library);
+            // 已绑定且缺少 ILT 时，IAT 是外部地址，不能作为名称令牌解读。
+            if (lookup == 0 && timestamp != 0) { unmodeledWrites = true; continue; }
+            var table = lookup == 0 ? iat : lookup;
+            for (ulong i = 0; ; i++)
+            {
+                var value = reader.U64(Map(checked(table + i * 8), 8));
+                _ = Map(checked(iat + i * 8), 8);
+                if (value == 0) break;
+                string symbol;
+                if ((value & (1UL << 63)) != 0)
+                {
+                    if ((value & 0x7FFFFFFFFFFF0000UL) != 0) throw new InvalidDataException("PE import ordinal 保留位非零");
+                    symbol = $"{library}!#{value & 0xffff}";
+                }
+                else
+                {
+                    if (value > 0x7fffffff) throw new InvalidDataException("PE import name RVA 保留位非零");
+                    _ = Map(value, 2);
+                    symbol = Name(value + 2);
+                }
+                if (!imports.TryAdd(checked(imageBase + iat + i * 8), symbol)) throw new InvalidDataException("PE import IAT 槽位重复");
+                modules.Add(checked(imageBase + iat + i * 8), library);
+            }
+        }
+        throw new InvalidDataException("PE import descriptor 缺少终止项");
     }
 
     private static void ReadPeExports(ImageReader reader, List<ImageRange> ranges, ulong imageBase, uint rva, Dictionary<string, ulong> exports)

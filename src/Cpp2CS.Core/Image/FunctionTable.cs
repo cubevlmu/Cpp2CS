@@ -40,7 +40,7 @@ public sealed class FunctionTable
             var middle = low + (high - low) / 2;
             var range = ranges[middle];
             if (address < range.Start) { high = middle - 1; continue; }
-            if (address >= range.End) { low = middle + 1; continue; }
+            if (address >= range.ContiguousEnd) { low = middle + 1; continue; }
             return range;
         }
         return null;
@@ -206,6 +206,8 @@ public sealed class FunctionTable
             var root = entry;
             for (var depth = 0; (Flags(image, root.Unwind) & 4) != 0; depth++)
             {
+                if ((Flags(image, root.Unwind) & 3) != 0)
+                    throw new InvalidDataException($"0x{root.Start:x}: CHAININFO 不能同时声明异常处理器");
                 if (depth > 32) throw new InvalidDataException($"0x{entry.Start:x}: UNWIND_INFO 链过深或成环");
                 var parent = Entry(image, image.Read(Trailer(image, root.Unwind), 12));
                 if (!byStart.TryGetValue(parent.Start, out var listed) || listed != parent)
@@ -214,7 +216,7 @@ public sealed class FunctionTable
             }
             if (root == entry) { roots.Add(entry); continue; }
             if (!fragments.TryGetValue(root.Start, out var list)) fragments[root.Start] = list = [];
-            list.Add(new(entry.Start, entry.End, BoundaryEvidence.Pdata, "chained"));
+            list.Add(new(entry.Start, entry.End, BoundaryEvidence.Pdata, "chained") { WindowsUnwind = Record(image, entry) });
         }
 
         var ranges = new FunctionRange[roots.Count];
@@ -236,6 +238,8 @@ public sealed class FunctionTable
                 Fragments = fragments.TryGetValue(root.Start, out var list) ? list.ToArray() : [],
                 Handler = handler,
                 HandlerData = data,
+                UnwindFlags = (byte)Flags(image, root.Unwind),
+                WindowsUnwind = Record(image, root),
             };
         }
         return new(ranges, ".pdata") { Skipped = skipped };
@@ -255,4 +259,13 @@ public sealed class FunctionTable
 
     private static ulong Trailer(ImageDocument image, ulong unwind) =>
         checked(unwind + 4 + (ulong)((image.Read(unwind, 4)[2] + 1) & ~1) * 2);
+
+    private static WindowsUnwindRecord Record(ImageDocument image, PdataEntry entry)
+    {
+        var header = image.Read(entry.Unwind, 4);
+        var flags = (byte)Flags(image, entry.Unwind);
+        var codes = image.Read(entry.Unwind + 4, header[2] * 2).ToArray();
+        return new(entry.Unwind, (byte)(header[0] & 7), flags, header[1], (byte)(header[3] & 15), (header[3] >> 4) * 16,
+            codes, (flags & 4) == 0 ? null : Entry(image, image.Read(Trailer(image, entry.Unwind), 12)).Start);
+    }
 }

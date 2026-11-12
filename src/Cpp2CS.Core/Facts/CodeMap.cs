@@ -15,6 +15,12 @@ public sealed record CodeFunction(ulong Start, ulong End, CodeRegion Region, Bou
     public ExceptionRegion[] ExceptionRegions { get; init; } = [];
     /// <summary>PLT 桩所引用的动态符号名。</summary>
     public string? Import { get; init; }
+    /// <summary>平台异常处理或分离片段尚未转换为控制流边。</summary>
+    public bool HasUnmodeledExceptions { get; init; }
+    /// <summary>已核实仅有展开清理处理器且没有分离片段；不保证清理代码不会改变返回路径。</summary>
+    public bool HasUnwindOnlyHandler { get; init; }
+    /// <summary>PE 主范围、逐片展开状态及处理器证据；不代表已完成异常到托管的投影。</summary>
+    public FunctionRange? WindowsRange { get; init; }
 }
 
 /// <summary>
@@ -87,7 +93,8 @@ public sealed class CodeMap
         return null;
     }
 
-    public CodeRegion RegionOf(ulong address) => Region(Image.SectionAt(address));
+    public CodeRegion RegionOf(ulong address) => Image.Architecture == Architecture.X64
+        ? At(address)?.Region ?? CodeRegion.Other : Region(Image.SectionAt(address));
 
     private static CodeRegion Region(ImageSection? section) => section?.Name switch
     {
@@ -233,6 +240,45 @@ public sealed class CodeMap
             gaps.Add(new(start, end, kind));
         }
         return new(image, code, list.ToArray(), patches, gaps.ToArray(), table.Skipped, referenced);
+    }
+
+    /// <summary>PE 展开表边界及元数据入口候选；无展开信息的终点必须再经控制流验证。</summary>
+    public static CodeMap BuildPe(ImageDocument image, IEnumerable<ulong> managedEntries)
+    {
+        if (image.Architecture != Cpp2CS.Model.Architecture.X64)
+            throw new NotSupportedException("PE 代码地图要求 x64 映像");
+        var code = image.Sections.Where(s => s.Executable).Select(s =>
+            (s, (ReadOnlyMemory<byte>)image.ReadUpTo(s.Address, checked((int)s.Size)).ToArray())).ToArray();
+        var table = FunctionTable.Build(image);
+        var entries = managedEntries.Where(image.IsExecutable).Distinct().Order().ToArray();
+        var managed = entries.ToHashSet();
+        var list = table.Ranges.Select(r => new CodeFunction(r.Start, r.ContiguousEnd,
+            managed.Contains(r.Start) ? CodeRegion.Managed : CodeRegion.Runtime, r.Evidence)
+            {
+                HasUnmodeledExceptions = r.Handler is not null || r.HasSeparatedFragments,
+                HasUnwindOnlyHandler = r.Handler is not null && r.UnwindFlags == 2 && !r.HasSeparatedFragments,
+                WindowsRange = r,
+            }).ToList();
+        var fragments = table.Ranges.SelectMany(r => r.Fragments).OrderBy(f => f.Start).ToArray();
+        var fragmentStarts = fragments.Select(f => f.Start).ToArray();
+        var boundaries = entries.Concat(table.Ranges.SelectMany(r => new[] { r.Start, r.ContiguousEnd }))
+            .Concat(fragments.SelectMany(f => new[] { f.Start, f.End })).Distinct().Order().ToArray();
+        var referenced = new Dictionary<ulong, string>();
+        foreach (var entry in entries)
+        {
+            if (table.At(entry) is not null) continue;
+            var fragmentIndex = Array.BinarySearch(fragmentStarts, entry);
+            if (fragmentIndex < 0) fragmentIndex = ~fragmentIndex - 1;
+            if (fragmentIndex >= 0 && fragments[fragmentIndex].Contains(entry)) continue;
+            var section = image.SectionAt(entry)!;
+            var index = Array.BinarySearch(boundaries, entry);
+            var end = index + 1 < boundaries.Length ? Math.Min(boundaries[index + 1], section.Address + section.Size) : section.Address + section.Size;
+            if (end <= entry) continue;
+            list.Add(new(entry, end, CodeRegion.Managed, BoundaryEvidence.SymbolCandidate));
+            referenced.Add(entry, "metadata");
+        }
+        list.Sort((a, b) => a.Start.CompareTo(b.Start));
+        return new(image, code, list.ToArray(), [], [], table.Skipped, referenced);
     }
 
     private static List<(ulong Start, ulong End)> Uncovered((ImageSection s, ReadOnlyMemory<byte>)[] code, List<CodeFunction> sorted)

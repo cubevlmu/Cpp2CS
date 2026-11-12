@@ -5,7 +5,7 @@ using static Cpp2CS.Idioms.IdiomRewriter;
 
 namespace Cpp2CS.Idioms;
 
-internal sealed class IdiomState(IdiomRewriter owner, MachineFunction function)
+internal sealed class IdiomState(IdiomRewriter owner, MachineFunction function, IdiomResult? result = null)
 {
     internal readonly IdiomRewriter owner = owner;
     internal readonly MachineFunction function = function;
@@ -15,7 +15,7 @@ internal sealed class IdiomState(IdiomRewriter owner, MachineFunction function)
     /// <summary>泛型虚方法解析结果（MethodInfo*）→ 方法。</summary>
     internal readonly Dictionary<Variable, MethodRef> genericVirtual = new();
     /// <summary>守卫之外的 InitMetadata 调用及其结果代表的符号；Calls 之后替换为定义（或删除）。</summary>
-    internal readonly List<(Call Call, Symbol Value)> lazyValues = [];
+    internal readonly List<(Call Call, ulong Slot, Symbol Value)> lazyValues = [];
     /// <summary>由槽位读取得到的符号 → 槽位地址（模板实例的输入位置）。</summary>
     internal readonly Dictionary<Symbol, ulong> symbolSlots = new();
     internal NameSupply? Names;
@@ -27,7 +27,7 @@ internal sealed class IdiomState(IdiomRewriter owner, MachineFunction function)
     internal bool foldedRuntimeGuards;
     internal bool rgctxReady;
     internal readonly List<(Block End, ulong Guard)> initializedGuards = [];
-    public IdiomResult Result { get; } = new();
+    public IdiomResult Result { get; } = result ?? new();
     private Cpp2CS.Machine.Algebra.PassList? passes;
     internal Cpp2CS.Machine.Algebra.PassList Passes => passes ??= new(function, Result.Passes);
     /// <summary>记录形态已命中、证明未成立的规则；不改变恢复结果。</summary>

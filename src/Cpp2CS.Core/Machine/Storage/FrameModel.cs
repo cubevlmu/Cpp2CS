@@ -36,12 +36,15 @@ internal sealed record FrameReach(IReadOnlyList<Store> Stores, bool FromEntry, S
 internal sealed class FrameModel
 {
     private const int ReachBudget = 8192;
+    private const int PointerBudget = 8192;
+    internal bool PointerAnalysisComplete { get; private set; } = true;
 
     private readonly record struct CallRange(long Offset, int Size, MemoryAccess Access);
 
     private readonly MachineFunction function;
     private readonly IFrameCallEffects calls;
     private readonly Dictionary<Variable, Expr> definitions = [];
+    private readonly Dictionary<Variable, Phi> pointerPhis = [];
     private readonly Dictionary<Variable, HashSet<long>> pointsTo = [];
     private readonly Dictionary<long, HashSet<long>> held = [];
     /// <summary>以帧地址为基址、加变量下标得到的地址：只在作为读写地址时不算逃逸。</summary>
@@ -57,18 +60,41 @@ internal sealed class FrameModel
         this.calls = calls;
         foreach (var statement in function.Blocks.SelectMany(b => b.Statements))
             if (statement is Define define) definitions[define.Target] = define.Value;
+            else if (statement is Phi phi) pointerPhis[phi.Target] = phi;
         SolvePointers();
+        if (!PointerAnalysisComplete) return;
         foreach (var statement in function.Blocks.SelectMany(b => b.Statements)) Collect(statement);
         SolveEscapes();
     }
 
     /// <summary>地址可能指向的帧偏移；不指向固定帧时为空。</summary>
-    public IReadOnlyCollection<long> Targets(Expr address) => Points(address).Distinct().ToArray();
+    public IReadOnlyCollection<long> Targets(Expr address) => PointerAnalysisComplete ? Points(address).Distinct().ToArray() : [];
 
     /// <summary>地址唯一指向的帧偏移。</summary>
-    public long? Slot(Expr address) => Targets(address) is { Count: 1 } targets ? targets.First() : null;
+    public long? Slot(Expr address) => Targets(address) is { Count: 1 } targets && OnlyFrameOrigins(address, [], 0) ? targets.First() : null;
 
-    public bool Escaped(long offset, int bytes) => escaped.Any(e => Overlaps(e.Offset, e.Size, offset, bytes));
+    // 可能指向集合只记录帧内候选；没有帧内候选的 φ 入边仍是未知，不能被当成“已知无”。
+    private bool OnlyFrameOrigins(Expr expression, HashSet<Variable> seen, int depth)
+    {
+        if (depth > 32) return false;
+        switch (expression)
+        {
+            case FrameAddress: return true;
+            case Use use:
+                if (!seen.Add(use.Variable)) return false;
+                var known = definitions.TryGetValue(use.Variable, out var definition) ? OnlyFrameOrigins(definition, seen, depth + 1)
+                    : pointerPhis.TryGetValue(use.Variable, out var phi) && phi.Sources.Length > 0
+                        && phi.Sources.All(s => s is not null && OnlyFrameOrigins(new Use(s, 64), seen, depth + 1));
+                seen.Remove(use.Variable);
+                return known;
+            case Binary { Op: BinOp.Add or BinOp.Sub, Right: Const } offset: return OnlyFrameOrigins(offset.Left, seen, depth + 1);
+            case Binary { Op: BinOp.Add, Left: Const } offset: return OnlyFrameOrigins(offset.Right, seen, depth + 1);
+            case Select select: return OnlyFrameOrigins(select.True, seen, depth + 1) && OnlyFrameOrigins(select.False, seen, depth + 1);
+            default: return false;
+        }
+    }
+
+    public bool Escaped(long offset, int bytes) => !PointerAnalysisComplete || escaped.Any(e => Overlaps(e.Offset, e.Size, offset, bytes));
 
     /// <summary>
     /// 区间不再被读取，地址未逃逸，调用也不经指针观察它。没有被直接读取过的槽可能是未解析调用的栈实参，因此要求调用不读这段栈；
@@ -91,6 +117,7 @@ internal sealed class FrameModel
     /// <summary>第 index 条语句之前，[offset, offset+bytes) 的来源。throughCalls：已知调用不改写它，只看写入。</summary>
     public FrameReach Reach(Block block, int index, long offset, int bytes, bool throughCalls = false)
     {
+        if (!PointerAnalysisComplete) return new([], false, null, true);
         var stores = new List<Store>();
         var fromEntry = false;
         var steps = 0;
@@ -134,7 +161,7 @@ internal sealed class FrameModel
                         return IndexedRoots(store.Target).Any(root => Overlaps(root, ceiling is { } end && end > root ? checked((int)(end - root)) : null, offset, bytes))
                             || Escaped(offset, bytes);
                     }
-                    if (targets.Count == 1 && targets.First() <= offset && targets.First() + width >= offset + bytes)
+                    if (targets.Count == 1 && OnlyFrameOrigins(store.Target, [], 0) && targets.First() <= offset && targets.First() + width >= offset + bytes)
                     {
                         definite = store;
                         return true;
@@ -160,10 +187,18 @@ internal sealed class FrameModel
     private void SolvePointers()
     {
         var statements = function.Blocks.SelectMany(b => b.Statements).ToArray();
+        var steps = 0;
         for (var changed = true; changed;)
         {
             changed = false;
             foreach (var statement in statements)
+            {
+                // 循环中的帧指针递增会产生无限偏移集合；不完整集合不能支持转发或死存储证明。
+                if (++steps > PointerBudget)
+                {
+                    PointerAnalysisComplete = false;
+                    return;
+                }
                 switch (statement)
                 {
                     case Define { Target.Width: 64 } define:
@@ -180,6 +215,7 @@ internal sealed class FrameModel
                             foreach (var slot in Points(store.Target).ToArray()) changed |= Add(held, slot, values);
                         break;
                 }
+            }
         }
     }
 
@@ -255,7 +291,7 @@ internal sealed class FrameModel
                 break;
             case Store store:
                 {
-                    var direct = Points(store.Target).Any();
+                    var direct = Points(store.Target).Any() && OnlyFrameOrigins(store.Target, [], 0);
                     if (IndexedRoots(store.Target).Any()) WalkIndex(store.Target);
                     else if (!direct) Walk(store.Target, true);
                     // 经下标写入帧的地址按存入不可追踪的位置处理。

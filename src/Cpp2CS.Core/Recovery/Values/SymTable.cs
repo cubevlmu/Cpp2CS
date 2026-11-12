@@ -130,6 +130,9 @@ public sealed partial class SymTable
                     }
                     return Concat(parts);
                 }
+            // 位片只观察被选择分支的对应位，不需要为未使用的向量高位恢复托管类型。
+            case OpSym { Op.Kind: OperatorKind.Select, Args: [var condition, var whenTrue, var whenFalse] }:
+                return Select(condition, Slice(whenTrue, low, width), Slice(whenFalse, low, width), width);
             case OpSym { Op: { Kind: OperatorKind.Convert } op } convert when op.Conversion == ConvKind.SignExtend && low + width <= convert.Args[0].Width:
                 return Slice(convert.Args[0], low, width);
             case OpSym { Op: { Kind: OperatorKind.Binary } op } binary when op.Binary is BinOp.And or BinOp.Or or BinOp.Xor

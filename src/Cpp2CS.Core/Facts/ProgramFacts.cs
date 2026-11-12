@@ -5,7 +5,22 @@ namespace Cpp2CS.Facts;
 /// <summary>基础事实与派生事实的只读组合；初始化转发保留构造兼容性。</summary>
 public sealed class ProgramFacts
 {
+    private NativeCallSummaries? nativeCalls;
+    internal NativeCallSummaries NativeCalls => LazyInitializer.EnsureInitialized(ref nativeCalls, () => new(this));
+    private NativeIcallBindings? nativeIcalls;
+    internal NativeIcallBindings NativeIcalls => LazyInitializer.EnsureInitialized(ref nativeIcalls, () => new(this));
+    private NativeCopyProof? nativeCopies;
+    internal NativeCopyProof NativeCopies => LazyInitializer.EnsureInitialized(ref nativeCopies, () => new(this));
+    private NativeInterfaceInvokeProof? nativeInterfaceInvokes;
+    internal NativeInterfaceInvokeProof NativeInterfaceInvokes => LazyInitializer.EnsureInitialized(ref nativeInterfaceInvokes, () => new(this));
+    private NativeRuntimeAliases? nativeRuntimeAliases;
+    internal NativeRuntimeAliases NativeRuntimeAliases => LazyInitializer.EnsureInitialized(ref nativeRuntimeAliases, () => new(this));
+    public Cpp2CS.Machine.Flow.IMachine CreateMachine() => Base.MachineFactory?.Invoke()
+        ?? (Model.Image.Architecture == Architecture.Arm64 ? new Cpp2CS.Machine.Flow.Arm64Machine(Code)
+            : throw new NotSupportedException("映像缺少对应的机器后端"));
+    public ManagedAbi CreateAbi() => new(Layouts, Model.Image.Architecture);
     public BaseFacts Base { get; private set; } = new();
+    public IReadOnlyDictionary<ulong, NativeInputContract> NativeInputs => Base.NativeInputs;
     public DerivedFacts Derived { get; private set; } = new();
     public ProgramFacts() { }
     public ProgramFacts(BaseFacts basis, DerivedFacts derived) { Base = basis; Derived = derived; }

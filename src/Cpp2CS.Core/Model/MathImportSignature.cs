@@ -3,8 +3,9 @@ namespace Cpp2CS.Model;
 /// <summary>C 数学库标量函数的签名；带指针出参的函数另行处理。</summary>
 internal sealed record MathImportSignature(bool Single, string[] Parameters, bool IntegerExponent = false)
 {
-    internal Cpp2CS.Ir.Storage Register(int parameter) => IntegerExponent && parameter == 1
-        ? Cpp2CS.Ir.Storage.Gpr(0) : Cpp2CS.Ir.Storage.Vec(parameter);
+    internal Cpp2CS.Ir.Storage Register(int parameter) => Register(parameter, false);
+    internal Cpp2CS.Ir.Storage Register(int parameter, bool win64) => IntegerExponent && parameter == 1
+        ? Cpp2CS.Ir.Storage.Gpr(win64 ? 2 : 0) : Cpp2CS.Ir.Storage.Vec(parameter);
     internal bool IsInteger(int parameter) => IntegerExponent && parameter == 1;
     internal static MathImportSignature? Find(string? symbol)
     {

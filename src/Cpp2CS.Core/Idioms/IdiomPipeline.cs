@@ -85,13 +85,24 @@ internal static class IdiomPipeline
         state.Passes.Run("idioms.Residuals", () => state.Residuals());
     }
 
-    private static void ToFixedPoint(IdiomState state, bool first)
+    // 这些规则只依赖 IR 和控制流，不读取 ARM64 的 ABI 或运行时布局。
+    private static readonly Rule[] Portable = Table.Where(r => r.Name is
+        "memory.constant" or "math.imports" or "conditions.finite" or "phi.equal-addresses" or "loops.affine" or "phi.address-loads"
+        or "select.address-loads" or "division.constant" or "phi.flags").ToArray();
+
+    internal static void RunPortable(this IdiomState state)
+    {
+        state.Cleanup();
+        ToFixedPoint(state, first: true, Portable);
+    }
+
+    private static void ToFixedPoint(IdiomState state, bool first, Rule[]? rules = null)
     {
         var changed = new List<string>();
         for (var round = 0; round < Rounds; round++)
         {
             changed.Clear();
-            foreach (var rule in Table)
+            foreach (var rule in rules ?? Table)
                 if ((first && round == 0 || !rule.Once) && state.Passes.Run($"idioms.{rule.Name}", () => Apply(state, rule)))
                     changed.Add(rule.Name);
             if (changed.Count == 0) break;
@@ -160,7 +171,7 @@ internal static class IdiomPipeline
 
     private static bool MathImports(IdiomState state)
     {
-        if (!MathImportNormalizer.Run(state.function, state.Fresh)) return false;
+        if (!MathImportNormalizer.Run(state.function, state.Fresh, state.facts.Model.Image.Architecture == Architecture.X64)) return false;
         if (state.facts.Options.PromoteFrameSlots && FrameSlotPromotion.Run(state.function) > 0)
             SsaBuilder.Build(state.function, Dominators.Compute(state.function), s => s.Bank == Bank.Stack, state.owner.calls, state.owner.NativeCallees.Convention.StackPointer);
         return true;

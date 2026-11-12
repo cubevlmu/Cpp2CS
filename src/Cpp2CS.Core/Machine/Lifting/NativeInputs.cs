@@ -8,25 +8,27 @@ using Storage = Cpp2CS.Ir.Storage;
 /// <summary>未化简 SSA 的入口读取；未知指令或不完整控制流不能证明参数未用。</summary>
 internal static class NativeInputs
 {
-    public static HashSet<Storage>? Reads(LiftedFunction lifted, Func<Call, Storage, bool>? unused = null, Func<Call, bool>? knownTail = null)
+    public static HashSet<Storage>? Reads(LiftedFunction lifted, Func<Call, Storage, bool>? unused = null, Func<Call, bool>? knownTail = null,
+        bool preserveAllReads = false, Func<Call, Storage, int?>? inputWidth = null)
     {
         var statements = lifted.Function.Blocks.SelectMany(b => b.Statements).ToArray();
         var tails = statements.OfType<Call>().Where(c => c.Kind == CallKind.TailIndirect).ToArray();
-        if (!lifted.Succeeded || lifted.Function.Problems.Count != 0
+        if (!lifted.Succeeded || lifted.Function.Range.HasUnmodeledExceptions || lifted.Function.Problems.Count != 0
             || lifted.Function.UnresolvedIndirectJumps != 0 && (lifted.Function.UnresolvedIndirectJumps != tails.Length
                 || !tails.All(c => VirtualTail(c, statements) || DelegateTail(c, statements) || knownTail?.Invoke(c) == true))
-            || statements.Any(s => s is Opaque or IndirectJump { Targets.Length: 0 })) return null;
+            || statements.Any(s => s is Opaque or Trap or IndirectJump { Targets.Length: 0 })) return null;
         if (unused is null)
             return statements.SelectMany(s => ExprMap.Operands(s).SelectMany(ExprMap.Walk).OfType<Use>().Select(u => u.Variable)
                     .Concat(s is Phi phi ? phi.Sources : []))
                 .Where(v => v.Version == 0).Select(v => v.Storage).ToHashSet();
         var definitions = new Dictionary<Variable, Variable[]>();
+        var expressions = new Dictionary<Variable, Expr>();
         var roots = new HashSet<Variable>();
         Variable[] Uses(IEnumerable<Expr> expressions) => expressions.SelectMany(ExprMap.Walk).OfType<Use>().Select(u => u.Variable).ToArray();
         foreach (var statement in statements)
         {
             if (statement is Phi phi) definitions[phi.Target] = phi.Sources;
-            else if (statement is Define define) definitions[define.Target] = Uses([define.Value]);
+            else if (statement is Define define) { definitions[define.Target] = Uses([define.Value]); expressions[define.Target] = define.Value; }
         }
         bool CarriesEntry(Expr value)
         {
@@ -40,6 +42,16 @@ internal static class NativeInputs
             }
             return false;
         }
+        // 原生签名只消费低位时，字节写入保留的寄存器高位不是实际输入；不跨未知运算或 phi 猜测。
+        Expr Narrow(Expr value, int width, int depth = 32)
+        {
+            if (depth == 0 || width >= value.Width) return value;
+            if (value is Use use && expressions.TryGetValue(use.Variable, out var expression)) return Narrow(expression, width, depth - 1);
+            if (value is Insert { Low: 0 } insert && width <= insert.Value.Width) return Narrow(insert.Value, width, depth - 1);
+            if (value is Cpp2CS.Ir.Convert { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend or ConvKind.Truncate } convert && width <= convert.Operand.Width)
+                return Narrow(convert.Operand, width, depth - 1);
+            return Fold.Simplify(new Extract(value, 0, width));
+        }
         foreach (var statement in statements)
         {
             if (statement is Phi) continue;
@@ -47,11 +59,13 @@ internal static class NativeInputs
             {
                 var inputs = Uses([define.Value]);
                 // 访存及未知运算仍是读取证据，不能因调用不消费结果而抹掉潜在异常。
-                if (ExprMap.Walk(define.Value).Any(e => e is Load or Intrinsic)) roots.UnionWith(inputs);
+                if (preserveAllReads || ExprMap.Walk(define.Value).Any(e => e is Load or Intrinsic
+                    or Binary { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem })) roots.UnionWith(inputs);
             }
             else if (statement is Call call)
-                roots.UnionWith(Uses([call.Target, .. call.Arguments.Where((value, i) => i >= call.Sources.Length
-                    || !CarriesEntry(value) || !unused(call, call.Sources[i]))]));
+                roots.UnionWith(Uses([call.Target, .. call.Arguments.Select((value, i) => i < call.Sources.Length
+                        && inputWidth?.Invoke(call, call.Sources[i]) is { } width ? Narrow(value, width) : value)
+                    .Where((value, i) => i >= call.Sources.Length || !CarriesEntry(value) || !unused(call, call.Sources[i]))]));
             else roots.UnionWith(Uses(ExprMap.Operands(statement)));
         }
         var pending = new Stack<Variable>(roots);

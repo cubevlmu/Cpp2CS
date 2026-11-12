@@ -40,11 +40,32 @@ public sealed record FunctionRange(ulong Start, ulong End, BoundaryEvidence Evid
     /// <summary>x64：通过 UNW_FLAG_CHAININFO 链到本函数的其他代码片段（已按地址排序）。</summary>
     public FunctionRange[] Fragments { get; init; } = [];
 
+    /// <summary>与主范围连续、且展开链属于同一函数的范围终点；不跨越空隙或其他函数。</summary>
+    public ulong ContiguousEnd
+    {
+        get
+        {
+            var end = End;
+            foreach (var fragment in Fragments)
+            {
+                if (fragment.Start != end) break;
+                end = fragment.End;
+            }
+            return end;
+        }
+    }
+
+    public bool HasSeparatedFragments => Fragments.Any(f => f.Start < Start || f.End > ContiguousEnd);
+
     /// <summary>x64：UNWIND_INFO 中的异常处理例程（UNW_FLAG_EHANDLER/UHANDLER），没有时为 null。</summary>
     public ulong? Handler { get; init; }
 
     /// <summary>x64：紧随处理例程 RVA 之后的语言相关数据的地址。</summary>
     public ulong? HandlerData { get; init; }
+
+    /// <summary>x64：原始 UNWIND_INFO 标志；保留搜索处理器与展开清理处理器的区别。</summary>
+    public byte UnwindFlags { get; init; }
+    public WindowsUnwindRecord? WindowsUnwind { get; init; }
 
     public ulong Size => End - Start;
 

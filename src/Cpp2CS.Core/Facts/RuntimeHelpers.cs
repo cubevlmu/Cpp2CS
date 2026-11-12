@@ -11,6 +11,8 @@ public enum HelperKind
     /// <summary>按编码令牌初始化元数据槽位（参数为槽位地址）。</summary>
     InitMetadata,
     ObjectNew, NewArray, NewArrayFull, Box, Unbox, ClassInit, Raise, WriteBarrier, IsAssignableFrom,
+    /// <summary>单参数 GC 位图通知，不读取或写入参数指向的引用。</summary>
+    GcNotification,
     /// <summary>构造并抛出指定异常（不返回）。Detail 为异常类型全名。</summary>
     Throw,
     /// <summary>未内联的判空：x0 为空时抛出 NullReferenceException，否则返回。</summary>
@@ -54,6 +56,8 @@ public enum HelperKind
     ConstrainedCall,
     /// <summary>UnBoxAny(obj, klass, storage)：IL 的 unbox.any，返回值所在位置（盒内或 storage）的地址。</summary>
     UnboxAny,
+    /// <summary>清除旧异常堆栈后抛出；第二参数为原生最后托管帧。</summary>
+    CodegenRaise,
 }
 
 /// <summary>一个被托管代码调用的辅助函数。Evidence 说明依据；Callers 为托管调用点数。</summary>
@@ -108,9 +112,20 @@ public sealed partial class RuntimeHelpers
     }
 
     public RuntimeHelper? At(ulong address) => helpers.GetValueOrDefault(address);
+    public static RuntimeHelpers Unclassified(CodeMap map, CodeScan scan) => new(map, scan);
+
+    /// <summary>后端提交已有独立证据的语义目标；不触发 ARM64 模式匹配。</summary>
+    public static RuntimeHelpers FromEvidence(CodeMap map, CodeScan scan, IEnumerable<RuntimeHelper> evidence)
+    {
+        var result = new RuntimeHelpers(map, scan);
+        foreach (var helper in evidence)
+            if (!result.helpers.TryAdd(helper.Address, helper)) throw new ArgumentException("运行时辅助函数证据地址重复");
+        return result;
+    }
 
     /// <summary>运行时模板内部的调用也沿导出链和指令形态识别，不要求它被托管函数直接调用。</summary>
-    public RuntimeHelper InternalCall(ulong address) => helpers.GetOrAdd(address, a => Classify(a, 0, 0));
+    public RuntimeHelper InternalCall(ulong address) => helpers.GetOrAdd(address, a => map.Image.Architecture == Architecture.X64
+        ? new(a, HelperKind.Unknown, null, "x64 辅助函数尚未分类", 0) : Classify(a, 0, 0));
 
     /// <summary>
     /// targets：托管代码调用的、没有托管所有者的目标及调用点数；slotAddressesBeforeCall：目标 → 调用点前紧邻构造了已解码元数据槽位地址的次数。
@@ -413,7 +428,8 @@ public sealed partial class RuntimeHelpers
     internal static string? CString(ImageDocument image, ulong address)
     {
         var section = image.SectionAt(address);
-        if (section is null || section.Name != ".rodata") return null;
+        if (section is null || section.Name != ".rodata"
+            && !(image.Architecture == Architecture.X64 && !section.Executable && (section.Flags & 1) == 0)) return null;
         var bytes = image.ReadUpTo(address, 128);
         var end = bytes.IndexOf((byte)0);
         if (end <= 0) return null;

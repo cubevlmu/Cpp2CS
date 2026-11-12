@@ -30,7 +30,8 @@ internal static class ClassInitializationFacts
         return changed;
     }
 
-    internal static bool Run(MachineFunction function, bool constructorFacts = true)
+    internal static bool Run(MachineFunction function, bool constructorFacts = true, int classFlagsOffset = RuntimeLayout.ClassBitflags1,
+        int constructorFinishedOffset = RuntimeLayout.ClassCctorFinishedOrNoCctor)
     {
         var points = function.Blocks.SelectMany(b => b.Statements.Select((s, i) => new Point(b, i, s))).ToArray();
         var initializers = points.Where(p => p.Statement is Call { Op: { Kind: OpKind.InitClass or OpKind.RunClassConstructor, Operand: TypeRef } }).ToArray();
@@ -51,9 +52,9 @@ internal static class ClassInitializationFacts
                 Width: 8 or 16, Address: Binary
                 {
                     Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type },
-                    Right: Const { Value: RuntimeLayout.ClassBitflags1 }
+                    Right: Const flagOffset
                 }
-            } => Initialized(type, OpKind.InitClass, at),
+            } when flagOffset.Value == (ulong)classFlagsOffset => Initialized(type, OpKind.InitClass, at),
             _ => false,
         };
         var changed = false;
@@ -76,9 +77,10 @@ internal static class ClassInitializationFacts
                             Width: 32, Address: Binary
                             {
                                 Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: DefinitionRef type },
-                                Right: Const { Value: RuntimeLayout.ClassCctorFinishedOrNoCctor }
+                                Right: Const finishedOffset
                             }
                         }
+                        && constructorFinishedOffset >= 0 && finishedOffset.Value == (ulong)constructorFinishedOffset
                         && Initialized(type, OpKind.RunClassConstructor, point))
                     { changed = true; return Expr.C(1, 32); }
                     if (value is Binary { Op: BinOp.And } mask

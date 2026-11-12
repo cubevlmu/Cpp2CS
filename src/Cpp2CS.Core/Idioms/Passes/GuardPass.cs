@@ -47,6 +47,7 @@ internal static class GuardPass
                 return false;
             if (state.recording)
                 state.Record(Template.MetadataInitGuard, head, state.Start(head), new() { ["merge"] = merge.Start }, new() { ["guard"] = guard.Value, ["slots"] = slots.ToArray(), ["helpers"] = calls.Select(c => ((Const)c.Target).Value).Distinct().ToArray(), });
+            state.ReleaseGuardRead(load);
             CollapsePass.Collapse(head, merge, head, [], overrides, branch.Address);
             state.Remove(chain);
             state.initializedGuards.Add((head, guard.Value));
@@ -68,8 +69,10 @@ internal static class GuardPass
         Expr Field(int offset) => Fold.Simplify(new Binary(BinOp.Add, subject, Expr.C((ulong)offset, 64), 64));
         var (kind, template, enter, skip, offset, width, returnsArgument) = helpers[0] switch
         {
-            HelperKind.ClassInit => (OpKind.RunClassConstructor, Template.ClassConstructorGuard, 0UL, 1UL, RuntimeLayout.ClassCctorFinishedOrNoCctor, 32, false),
-            HelperKind.InitializedTypeInfo => (OpKind.InitClass, Template.InitClassGuard, 0UL, 1UL, RuntimeLayout.ClassBitflags1, 8, true),
+            HelperKind.ClassInit => (OpKind.RunClassConstructor, Template.ClassConstructorGuard, 0UL, 1UL,
+                state.facts.Model.Image.Architecture == Architecture.X64 ? state.facts.Base.RuntimeOffsets?.ClassCctorFinished ?? -1 : RuntimeLayout.ClassCctorFinishedOrNoCctor, 32, false),
+            HelperKind.InitializedTypeInfo => (OpKind.InitClass, Template.InitClassGuard, 0UL, 1UL,
+                state.facts.Model.Image.Architecture == Architecture.X64 ? state.facts.Base.RuntimeOffsets?.ClassInitializationFlags ?? -1 : RuntimeLayout.ClassBitflags1, 8, true),
             HelperKind.InitMethodRgctx => (OpKind.InitMethodRgctx, Template.MethodRgctxGuard, 0UL, 0x1000UL, RuntimeLayout.MethodRgctxData, 64, true),
             _ => default,
         };
@@ -111,6 +114,7 @@ internal static class GuardPass
         var at = state.recording ? state.Start(head, argument) : default;
         if (state.recording && state.Location(subject, head, at) is { } where)
             state.Record(template, head, at, new() { ["merge"] = merge.Start }, new() { ["subject"] = where, ["helper"] = ((Const)helperCall.Target).Value });
+        state.ReleaseGuardRead(load);
         CollapsePass.Collapse(head, merge, head, [op, .. reload], merged, branch.Address);
         state.Remove(chain);
         state.Result.Hit(template);

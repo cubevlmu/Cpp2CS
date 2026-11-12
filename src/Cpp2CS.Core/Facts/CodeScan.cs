@@ -52,6 +52,24 @@ public sealed class CodeScan
 
     public FunctionShape ShapeOf(int function) => shapes[function];
 
+    /// <summary>尚未普查的后端不提供推断引用；调用方必须单独报告这一边界。</summary>
+    public static CodeScan Unscanned(CodeMap map) => new(map, [], new int[map.Functions.Count + 1], new FunctionShape[map.Functions.Count], []);
+
+    /// <summary>外部后端提供逐函数引用；未扫描函数保持空项，覆盖范围由调用方报告。</summary>
+    public static CodeScan FromReferences(CodeMap map, IReadOnlyDictionary<ulong, CodeRef[]> references)
+    {
+        var all = new List<CodeRef>();
+        var offsets = new int[map.Functions.Count + 1];
+        for (var i = 0; i < map.Functions.Count; i++)
+        {
+            offsets[i] = all.Count;
+            if (references.TryGetValue(map.Functions[i].Start, out var part))
+                all.AddRange(part.Distinct().OrderBy(r => r.Site));
+        }
+        offsets[^1] = all.Count;
+        return new(map, all.ToArray(), offsets, new FunctionShape[map.Functions.Count], []);
+    }
+
     public static CodeScan Run(CodeMap map)
     {
         var functions = map.Functions;

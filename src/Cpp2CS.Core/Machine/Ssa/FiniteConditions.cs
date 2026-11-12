@@ -6,7 +6,7 @@ namespace Cpp2CS.Machine.Ssa;
 
 
 /// <summary>常量状态标志经 φ 汇合后，只沿单前驱路径收窄取值，消除异常清理生成的不可达出口。</summary>
-internal sealed class FiniteConditions(MachineFunction function)
+internal sealed partial class FiniteConditions(MachineFunction function)
 {
     public static bool Simplify(MachineFunction function)
     {

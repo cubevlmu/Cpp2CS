@@ -83,7 +83,9 @@ internal static class InterfaceDispatchPass
                 continue;
             if (call.Arguments.Take(3).SelectMany(ExprMap.Walk).OfType<Use>().Any(u => regionDefined.Contains(u.Variable)))
                 continue;
-            if (state.defs.Expand(call.Arguments[2]) is not Const slot)
+            var slotValue = state.defs.Expand(call.Arguments[2]);
+            if (state.facts.Model.Image.Architecture == Architecture.X64) slotValue = Fold.Convert(ConvKind.Truncate, slotValue, 16);
+            if (slotValue is not Const slot)
                 continue;
             var target = state.defs.Expand(call.Arguments[0]);
             // 命中一侧的值 = klass + (offset << 4) + vtable + slot * 16，klass = *obj

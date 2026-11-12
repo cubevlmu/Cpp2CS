@@ -36,6 +36,8 @@ internal static class UsedPass
                     if (call.Arguments.Where((argument, i) => ExprMap.Walk(argument).OfType<Use>().Any(u => u.Variable == v) && (i >= call.Sources.Length || call.Sources[i] != hidden && !state.owner.UnusedInput(t.Value, call.Sources[i]))).Any())
                         return true;
                 }
+                else if (call.Arguments.Any(argument => ExprMap.Walk(argument).OfType<Use>().Any(u => u.Variable == v)))
+                    return true;
 
                 if (ExprMap.Walk(call.Target).OfType<Use>().Any(u => u.Variable == v))
                     return true;

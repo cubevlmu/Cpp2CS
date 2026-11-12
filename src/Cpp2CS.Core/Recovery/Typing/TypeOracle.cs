@@ -135,6 +135,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             // 收集证据时单元类型还不可用，这期间依赖单元类型得到的结果（按接收者选出的调用目标、经单元读取的类型）不能留用。
             memo.Clear();
             callees.Clear();
+            equivalentCalls.Clear();
             parts.Clear();
             storeGroups.Clear();
         }
@@ -142,18 +143,95 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     }
 
     public ManagedTypes Types => types;
+    internal MachineSignature? NativeSignature(MethodRef target) => facts.CreateAbi().Machine(target, out _);
+    internal CallShape CallShape(Call call) => shapes(call);
+
+    /// <summary>共享直接入口在 SSA 求值后才显露的确切 MethodInfo；沿用已登记候选与隐藏实参位置约束。</summary>
+    internal MethodRef? DirectMethodInfo(Call call)
+    {
+        if (facts.Model.Image.Architecture != Architecture.X64 || call.Op is not null
+            || call.Kind is not (CallKind.Direct or CallKind.Tail) || call.Target is not Const
+            || shapes(call) is not { Signature: null, Candidates.Count: > 0 } shape) return null;
+        var operands = values.Operands(call);
+        var matches = new HashSet<MethodRef>();
+        foreach (var candidate in shape.Candidates)
+            if (NativeSignature(candidate)?.MethodInfo is { Register.Bank: Bank.Gpr } info
+                && call.ArgumentIndex(info.Register) is var at and >= 0 && at + 1 < operands.Count
+                && SymTable.Resolve(operands[at + 1]) is EntitySym { Symbol: { Kind: SymbolKind.Method, Value: MethodRef exact } }
+                && exact.Method == candidate.Method && NativeSignature(InContext(exact))?.MethodInfo?.Register == info.Register)
+                matches.Add(InContext(exact));
+        return matches.Count == 1 ? matches.Single() : null;
+    }
+
+    private Cpp2CS.Facts.Derived.EmptyBaseConstructorProof? freshConstructors;
+    private Cpp2CS.Facts.Derived.NativeCalleeFacts? typedInputs;
+
+    /// <summary>混合 ABI 共享入口按独立已知的接收者类型消歧；隐藏上下文未被读取且候选身份必须唯一。</summary>
+    internal MethodRef? DirectReceiver(Call call)
+    {
+        if (facts.Model.Image.Architecture != Architecture.X64 || call.Op is not null
+            || call.Kind is not (CallKind.Direct or CallKind.Tail) || call.Target is not Const target
+            || shapes(call) is not { Signature: null, Candidates.Count: > 0 } shape
+            || facts.Code.At(target.Value) is not { HasUnmodeledExceptions: false, Start: var start } || start != target.Value) return null;
+        var operands = values.Operands(call);
+        var matches = new HashSet<MethodRef>();
+        foreach (var candidate in shape.Candidates)
+        {
+            if (candidate.Method.IsStatic || candidate.Method.Name is ".ctor" or ".cctor" || candidate.Method.GenericParameters.Count != 0
+                || NativeSignature(candidate) is not { This.Pieces: [{ Register.Bank: Bank.Gpr } self], MethodInfo.Register.Bank: Bank.Gpr } signature
+                || call.ArgumentIndex(self.Register) is not (var at and >= 0) || at + 1 >= operands.Count) continue;
+            var actual = TypeOf(operands[at + 1]);
+            if (candidate.Method.Owner.IsValueType != (actual is ByRefRef)) continue;
+            if (actual is ByRefRef byRef) actual = byRef.Element;
+            if (actual is not DefinitionRef owner || owner.Definition != candidate.Method.Owner) continue;
+            var bound = candidate with { TypeArguments = owner.Arguments };
+            if (NativeSignature(bound) is not { This.Pieces: [{ Register: var receiver }], MethodInfo: { } boundInfo }
+                || receiver != self.Register || boundInfo.Register != signature.MethodInfo!.Register
+                || !(typedInputs ??= new(facts, false)).UnusedInput(target.Value, signature.MethodInfo!.Register)) continue;
+            matches.Add(bound);
+        }
+        return matches.Count == 1 ? matches.Single() : null;
+    }
+
+    /// <summary>新分配对象的共享空入口：只在确切继承链中选择无参构造，基类调用仍交给构造模板核对。</summary>
+    internal MethodRef? FreshConstructor(Call call)
+    {
+        if (facts.Model.Image.Architecture != Architecture.X64 || call.Op is not null
+            || call.Kind is not (CallKind.Direct or CallKind.Tail) || call.Target is not Const target
+            || shapes(call) is not { Signature: null, Candidates.Count: > 0 } shape
+            || call.ArgumentIndex(Storage.Gpr(1)) is not (var at and >= 0)) return null;
+        var operands = values.Operands(call);
+        if (at + 1 >= operands.Count
+            || SymTable.Resolve(operands[at + 1]) is not ResultSym { Site.Op.Kind: OpKind.NewObject } allocation
+            || ClassOperand(allocation.Site) is not DefinitionRef { Definition.IsValueType: false } allocated
+            || !(freshConstructors ??= new(facts, facts.CreateAbi())).ReturnsOnly(target.Value)) return null;
+        var seen = new HashSet<TypeDef>();
+        for (TypeRef? current = allocated; current is DefinitionRef owner && seen.Add(owner.Definition);
+            current = owner.Definition.BaseType?.Substitute(owner.Arguments, []))
+        {
+            var matches = shape.Candidates.Where(c => c.Method is { Name: ".ctor", IsStatic: false, Parameters.Count: 0, GenericParameters.Count: 0 }
+                && c.Method.Owner == owner.Definition && c.Method.Address == target.Value && ManagedTypes.IsVoid(c.Method.ReturnType))
+                .Select(c => c.Method).Distinct().ToArray();
+            if (matches is not [var constructor]) continue;
+            var method = new MethodRef(constructor, owner.Arguments, []);
+            return NativeSignature(method)?.This?.Pieces is [{ Register: var receiver }] && receiver == Storage.Gpr(1) ? method : null;
+        }
+        return null;
+    }
+    internal int? VtableOffset => facts.Model.Image.Architecture == Architecture.Arm64
+        ? RuntimeLayout.ClassVtable : facts.Base.RuntimeOffsets?.ClassVtable;
 
     /// <summary>从接收者运行时类的虚表读取的方法；绑定仍需虚分派，不能当作静态类型上的直接方法。</summary>
     public MethodRef? VirtualMethod(Sym pointer, Sym receiver)
     {
-        if (SymTable.Resolve(pointer) is not ReadSym { Width: 64 } read
+        if (VtableOffset is not { } vtable || SymTable.Resolve(pointer) is not ReadSym { Width: 64 } read
             || Decompose(read.Address) is not (ReadSym { Width: 64 } klass, var offset, null, _)
-            || offset < RuntimeLayout.ClassVtable
-            || (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize is not (0 or 8)
+            || offset < vtable
+            || (offset - vtable) % RuntimeLayout.VirtualInvokeDataSize is not (0 or 8)
             || Decompose(klass.Address) is not (var instance, 0, null, _)
             || !ReferenceEquals(SymTable.Resolve(instance), SymTable.Resolve(receiver))
             || TypeOf(receiver) is not { } owner || !ManagedTypes.IsReferenceType(owner)) return null;
-        return DispatchResolution.VirtualSlot(owner, (int)((offset - RuntimeLayout.ClassVtable) / RuntimeLayout.VirtualInvokeDataSize), types, Substitute);
+        return DispatchResolution.VirtualSlot(owner, (int)((offset - vtable) / RuntimeLayout.VirtualInvokeDataSize), types, Substitute);
     }
 
     public TypeRef? LocationType(Call call, int argument, int width) => argument < call.OriginalArgumentCount
@@ -175,7 +253,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// <summary>
     /// 调用的托管目标。共享代码的地址对应多个实例：调用传入的 MethodInfo 实参指名确切的实例时取它；
     /// 实例方法的接收者类型确定声明类型的类型实参时按接收者代入；相同代码折叠的候选按接收者与实参类型选择，
-    /// 无法区分时取第一个（折叠的候选机器码相同）。
+    /// 候选仍不唯一时保持未知，机器码相同不能替代托管声明身份。
     /// </summary>
     public MethodRef? Callee(Call call)
     {
@@ -192,7 +270,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         if (shape.Signature?.MethodInfo is { } info && (info.Register.Bank == Bank.Stack ? StackInfo() : Register(info.Register)) is { } infoSym
             && SymTable.Resolve(infoSym) is EntitySym { Symbol: { Kind: SymbolKind.Method, Value: MethodRef exact } }
             && candidates.Any(c => c.Method == exact.Method))
-            return callees[call] = InContext(exact);
+            return callees[call] = AccessibleEquivalent(call, shape, InContext(exact));
         // 约束调用的 RGCTX 项指名接收者的确切类型，折叠的候选里取声明在该类型上的方法。
         if (shape.Signature?.MethodInfo is { Register.Bank: not Bank.Stack } constrainedInfo && Register(constrainedInfo.Register) is { } constrainedSym
             && SymTable.Resolve(constrainedSym) is EntitySym { Symbol: { Kind: SymbolKind.Constrained, Value: ValueTuple<TypeRef, MethodRef> { Item1: DefinitionRef constrained } } }
@@ -201,13 +279,38 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         var receiver = shape.Signature?.This is { } self && self.Pieces[0].Register.Bank == Bank.Gpr ? Register(self.Pieces[0].Register) : null;
         var receiverType = receiver is not null && call.Op?.Kind != OpKind.CallDelegate ? TypeOf(receiver) : null;
         if (receiverType is ByRefRef byRef) receiverType = byRef.Element;
+        if (receiverType is DefinitionRef exactOwner && candidates.Count > 1)
+            candidates = candidates.Select(c => ReceiverCandidate(call, c, exactOwner)).ToArray();
         var arguments = shape.Signature?.Arguments.Select(a => a.Transfer == Transfer.Value && a.Pieces.Length == 1 && a.Pieces[0].Register.Bank != Bank.Stack
             ? Register(a.Pieces[0].Register) : null).ToArray() ?? [];
         // 兼容的候选中取声明类型离接收者最近的（折叠的候选机器码相同，最派生的声明对接收者一定可用）。
-        var chosen = candidates.Count == 1 ? candidates[0]
-            : candidates.Where(c => Compatible(c, receiverType, arguments)).OrderBy(c => Distance(receiverType, c.DeclaringType)).FirstOrDefault() ?? candidates[0];
+        var compatible = candidates.Count == 1 ? candidates.ToArray() : candidates.Where(c => Compatible(c, receiverType, arguments)).ToArray();
+        if (compatible.Length == 0) return null;
+        var nearest = compatible.Min(c => Distance(receiverType, c.DeclaringType));
+        var identified = compatible.Where(c => Distance(receiverType, c.DeclaringType) == nearest).Distinct().ToArray();
+        var chosen = identified is [var unique] ? unique : EquivalentProjection(call, shape, identified, receiverType);
+        if (chosen is null) return null;
         if (receiverType is DefinitionRef owner && !chosen.Method.IsStatic) chosen = Specialize(chosen, owner);
-        return callees[call] = BindPlaceholders(chosen, arguments);
+        return callees[call] = AccessibleEquivalent(call, shape, BindPlaceholders(chosen, arguments));
+    }
+
+    /// <summary>ICF 的可访问等价声明：完整托管签名与初始化上下文相同，且直接目标不读取 MethodInfo。</summary>
+    private MethodRef AccessibleEquivalent(Call call, CallShape shape, MethodRef selected)
+    {
+        if (!shape.MethodInfoUnused || call.Op is not null || call.Kind is not (CallKind.Direct or CallKind.Tail)
+            || call.Target is not Const target || selected.Method.Address != target.Value
+            || selected.Method.Name is ".ctor" or ".cctor" || selected.Method.GenericParameters.Count != 0
+            || selected.Method.Owner.GenericParameters.Count != 0) return selected;
+        TypeRef? receiver = null;
+        if (!selected.Method.IsStatic)
+        {
+            if (shape.Signature?.This?.Pieces is not [{ Register: var self }]
+                || call.ArgumentIndex(self) is not (var position and >= 0)) return selected;
+            receiver = TypeOf(values.Operands(call)[position + 1]);
+            if (receiver is null) return selected;
+        }
+        if (ManagedAccess.Method(types, method.Method.Owner, selected, receiver)) return selected;
+        return EquivalentProjection(call, shape, shape.Candidates.Select(InContext).ToArray(), receiver) ?? selected;
     }
 
     /// <summary>
@@ -355,6 +458,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         foreach (var phi in uses.Keys.Concat(solution.Types.Keys).Distinct().ToArray())
             next[phi] = Resolve(Lower(phi), uses.GetValueOrDefault(phi) ?? [], phi.Width);
         var state = solution.Accept(next);
+        if (state == TypeSolveState.Changed) typeVersion++;
         uses = [];
         ClearCaches();
         return state;
@@ -364,6 +468,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     {
         memo.Clear();
         callees.Clear();
+        equivalentCalls.Clear();
         parts.Clear();
         storeGroups.Clear();
         cursors.Clear();
@@ -600,6 +705,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     {
         address = SymTable.Resolve(address);
         if (address is LocalSym local) return (local, 0, null, 0);
+        if (AffineAddress.Normalize(address) is { } affine && affine.Decompose(values.Syms, IsAddressRoot, out var normalized)) return normalized;
         var terms = new List<Sym>();
         Flatten(address, terms);
         long offset = 0;
@@ -613,7 +719,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (variable.Length == 1) { root = term; continue; }
             if (root is null && IsAddressRoot(term)) { root = term; continue; }
             if (index is null) { (index, scale) = (term, 1); continue; }
-            root ??= term;
+            // 旧的单下标表示装不下其他独立项，必须保留整个地址，不能丢弃未表示的项。
+            return (address, 0, null, 0);
         }
         return (root ?? address, offset, index, scale);
     }
@@ -683,8 +790,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                     if (index is not null && constant != 0)
                     {
                         // 比例下标可能已包含数组头或若干元素的常量偏移。
-                        while (index is SliceSym { Low: 0, Width: >= 32 } slice) index = SymTable.Resolve(slice.Base);
-                        if (index is PhiSym { Projection: { Low: 0 } projection, Width: >= 32 }) index = projection.Whole;
+                        index = ArrayIndexValue(index);
                         index = values.Syms.Convert(ConvKind.SignExtend, index, 64);
                         index = values.Syms.Binary(BinOp.Add, index, values.Syms.Const(unchecked((ulong)constant), 64), 64);
                         constant = 0;
@@ -732,8 +838,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case ByRefRef or PointerRef when index is null:
                 {
                     var element = rootType is ByRefRef r ? r.Element : ((PointerRef)rootType).Element;
-                    // 合流的托管指针只按被指类型的宽度访问，其他宽度不是这个位置。
-                    if (root is PhiSym && offset == 0 && types.Kind(element) != TypeKind.Struct && width > 1 && width != StorageBits(element)) return null;
+                    // 标量指针的整体访问必须等宽；窄访问交给位片拆分，宽访问不能丢掉相邻字节。
+                    if (offset == 0 && types.Kind(element) != TypeKind.Struct && width > 1 && width != StorageBits(element)) return null;
                     // 只有一个引用字段的结构体：机器读取得到的引用就是这个字段，它随后被当作对象指针使用。
                     if (offset == 0 && width == 64 && types.Kind(element) == TypeKind.Struct && types.Size(element) == 8
                         && FieldAt(element, RuntimeLayout.ObjectHeaderSize, 64, false, false) is var (only, onlyType) && ManagedTypes.IsReferenceType(onlyType))

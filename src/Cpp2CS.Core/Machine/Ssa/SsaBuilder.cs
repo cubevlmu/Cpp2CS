@@ -19,9 +19,9 @@ public sealed class ConservativeCallModel(CallingConvention convention) : ICallM
     private readonly Storage[] reads = [.. convention.IntegerArguments, .. convention.IndirectResult is { } x8 ? [x8] : Array.Empty<Storage>(), .. convention.FloatArguments];
     private readonly Storage[] results = [.. convention.IntegerResults, .. convention.FloatResults];
 
-    public IReadOnlyList<Storage> Reads(Call call) => reads;
-    public IReadOnlyList<Storage> Results(Call call) => call.Kind is CallKind.Tail or CallKind.TailIndirect ? [] : results;
-    public IReadOnlyList<Storage> Clobbers(Call call) => convention.Clobbered;
+    public IReadOnlyList<Storage> Reads(Call call) => call.Op?.Kind == OpKind.MemoryBarrier ? [] : reads;
+    public IReadOnlyList<Storage> Results(Call call) => call.Op?.Kind == OpKind.MemoryBarrier || call.Kind is CallKind.Tail or CallKind.TailIndirect ? [] : results;
+    public IReadOnlyList<Storage> Clobbers(Call call) => call.Op?.Kind == OpKind.MemoryBarrier ? [] : convention.Clobbered;
 }
 
 /// <summary>
@@ -272,7 +272,7 @@ public sealed class SsaBuilder
                                 value = Fold.Convert(ConvKind.ZeroExtend, value, target.Width);
                             var version = Fresh(target);
                             Push(index[target], version);
-                            output.Add(new Define(assign.Address, new Variable(target, version), value));
+                            output.Add(new Define(assign.Address, new Variable(target, version), value) { PreserveRead = assign.PreserveRead });
                             break;
                         }
                     case Call call:

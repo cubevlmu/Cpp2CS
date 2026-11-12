@@ -143,6 +143,7 @@ internal sealed partial class TemplateRecovery
             body = next;
             progressed = true;
         }
+        body = InlineCalls(body);
         body = DeadPendingReads(OverlaidReads(body));
         // 未证明的访问：值与写入目标都换成洞。
         ManagedValue Seal(ManagedValue value)
@@ -581,7 +582,8 @@ internal sealed partial class TemplateRecovery
                     if (!MatchStores(callee, caller, match)) return false;
                     continue;
                 case (ManagedCall mc, ManagedCall cc) when Instantiated(mc.Invocation.Method, match.TypeArguments).Equals(cc.Invocation.Method)
-                    && mc.Invocation.Arguments.Count == cc.Invocation.Arguments.Count:
+                    && mc.Invocation.Arguments.Count == cc.Invocation.Arguments.Count
+                    && (mc.Invocation.Virtual == cc.Invocation.Virtual || cc.Invocation.Receiver is { } target && NonNull(caller, target)):
                     {
                         if ((mc.Invocation.Receiver is null) != (cc.Invocation.Receiver is null)) return false;
                         var pairs = (mc.Invocation.Receiver is { } mr ? [(mr, cc.Invocation.Receiver!)] : Array.Empty<(ManagedValue, ManagedValue)>())

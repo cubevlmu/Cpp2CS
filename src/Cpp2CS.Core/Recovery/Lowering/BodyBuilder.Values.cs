@@ -84,6 +84,12 @@ internal sealed partial class BodyBuilder
     private ManagedValue Coerce(ManagedValue value, TypeRef? expected, ulong address = 0)
     {
         if (expected is null || value.Type.Equals(expected) || value is HoleValue) return value;
+        // 同址单字段包装的 ref 视图仍指向原位置；取址只允许直接访问的可写字段。
+        if (value.Type is ByRefRef sourceReference && expected is ByRefRef targetReference
+            && types.Kind(sourceReference.Element) == TypeKind.Struct
+            && oracle.Inside(sourceReference.Element, targetReference.Element) is var (referencePath, referenceType)
+            && WritableReferencePath(referencePath))
+            return new AddressValue(Nest(value, referencePath, referenceType, true, address));
         // 表示链上的同一段位：进入单字段结构体的字段；最内层为整数时按整数宽度一致的期望取值；外层按字段组成。
         if (oracle.Inside(value.Type, expected) is var (contained, _))
             return Nest(value, contained, expected, false, address);
@@ -161,7 +167,29 @@ internal sealed partial class BodyBuilder
                 {
                     // 整段位的比较使用结构体所包住的标量或引用。
                     var hint = typing.Inputs[0];
-                    return new ComparisonValue(op.Op.Cond, View(op.Args[0], hint, address), View(op.Args[1], hint, address), types.Boolean);
+                    var condition = op.Op.Cond;
+                    bool? constantResult = null;
+                    if (hint is not null && ManagedTypes.IsReferenceType(hint) && op.Args.All(a => a.Width == 64))
+                    {
+                        if (SymTable.IsZero(op.Args[0]))
+                        {
+                            constantResult = condition is Cond.Ugt ? false : condition is Cond.Ule ? true : null;
+                            condition = condition switch { Cond.Ult => Cond.Ne, Cond.Uge => Cond.Eq, _ => condition };
+                        }
+                        else if (SymTable.IsZero(op.Args[1]))
+                        {
+                            constantResult = condition is Cond.Ult ? false : condition is Cond.Uge ? true : null;
+                            condition = condition switch { Cond.Ugt => Cond.Ne, Cond.Ule => Cond.Eq, _ => condition };
+                        }
+                    }
+                    if (constantResult is { } bit)
+                    {
+                        // 即使 unsigned 的零边界决定结果，操作数读取仍可能抛异常，须求值一次。
+                        var probe = new ComparisonValue(Cond.Eq, View(op.Args[0], hint, address), View(op.Args[1], hint, address), types.Boolean);
+                        var result = new ConstantValue(bit ? 1UL : 0, types.Boolean, 1);
+                        return new ChoiceValue(probe, result, result, types.Boolean, 1);
+                    }
+                    return new ComparisonValue(condition, View(op.Args[0], hint, address), View(op.Args[1], hint, address), types.Boolean);
                 }
             case OperatorKind.And or OperatorKind.Or:
                 return new BooleanValue(op.Op.Kind == OperatorKind.And, View(op.Args[0], types.Boolean, address), View(op.Args[1], types.Boolean, address), types.Boolean);
@@ -277,6 +305,9 @@ internal sealed partial class BodyBuilder
         {
             case TypeKind.Struct when expected is DefinitionRef structure:
                 return StructBits(concat, structure, address);
+            case TypeKind.Float or TypeKind.Double when concat.Width == Width(expected) && concat.Parts.All(p => p is not UndefSym):
+                // 浮点位片先按整数重组，再保留位型转换；不把清除符号位改写成浮点算术。
+                return Coerce(Composite(concat, types.Integer(concat.Width, false), address), expected, address);
             case TypeKind.Int or TypeKind.Bool or TypeKind.Pointer:
                 {
                     var parts = concat.Parts;
@@ -325,7 +356,7 @@ internal sealed partial class BodyBuilder
     /// </summary>
     private LocalValue? StructPhi(DefinitionRef structure, AggregatePlan plan)
     {
-        if (plan.Fields.Count == 0 || !plan.Fields.Any(f => f.Projection.Path.Any(p => !fields.Accessible(p, p.DeclaringType)))) return null;
+        if (plan.Fields.Count == 0 || !plan.Fields.Any(f => f.Projection.Path.Any(NeedsConstruction))) return null;
         var leaves = new List<(ValueProjection, PhiSym, int)>();
         foreach (var field in plan.Fields)
             switch (SymTable.Resolve(field.Value))
@@ -372,9 +403,12 @@ internal sealed partial class BodyBuilder
     private ManagedValue Composed(DefinitionRef structure, List<(IReadOnlyList<FieldRef> Path, ManagedValue Value)> leaves, ulong address)
     {
         if (TryCompose(structure, leaves, address) is { } composed) return composed;
-        var hidden = leaves.SelectMany(l => l.Path).First(f => !fields.Accessible(f, f.DeclaringType));
-        return Hole(address, $"内存 字段 {hidden.Field.Owner.FullName}.{hidden.Field.Name} 对调用方不可访问，结构体值按叶子组成", structure);
+        var hidden = leaves.SelectMany(l => l.Path).First(NeedsConstruction);
+        return Hole(address, $"内存 字段 {hidden.Field.Owner.FullName}.{hidden.Field.Name} 不允许逐字段初始化，结构体构造尚未证明", structure);
     }
+
+    private bool NeedsConstruction(FieldRef field) => !fields.Accessible(field, field.DeclaringType)
+        || (field.Field.Attributes & System.Reflection.FieldAttributes.InitOnly) != 0;
 
     /// <summary>
     /// 结构体值的托管写法：字段都可访问时逐字段组成；否则依次尝试构造函数证明、同一结构体的复制，
@@ -382,7 +416,7 @@ internal sealed partial class BodyBuilder
     /// </summary>
     private ManagedValue? TryCompose(DefinitionRef structure, List<(IReadOnlyList<FieldRef> Path, ManagedValue Value)> leaves, ulong address)
     {
-        if (!leaves.Any(l => l.Path.Any(f => !fields.Accessible(f, f.DeclaringType)))) return new ComposedValue(structure, leaves);
+        if (!leaves.Any(l => l.Path.Any(NeedsConstruction))) return new ComposedValue(structure, leaves);
         // 显式布局中重叠的同一段位按可访问的字段组成，不可访问的字段不必再写。
         if (leaves.Where(l => l.Path[^1] is var field && !fields.Accessible(field, field.DeclaringType) && ExplicitLayout(field, out var owner)
             && types.Fields(owner).First(f => f.Path[0].Equals(field)) is var self
@@ -445,7 +479,8 @@ internal sealed partial class BodyBuilder
         // 没有列出的叶子为零或未定义，来源上的这些叶子不一定如此，不是一次复制。
         if (types.Projections(structure).Any(p => !leaves.Any(l => p.Path.Take(l.Path.Count).SequenceEqual(l.Path)))) return null;
         if (changed.Count == 0) return source;
-        if (!CanEmitBefore(changed.Select(c => c.Value))) return null;
+        if (changed.Any(c => (c.Field.Field.Attributes & System.Reflection.FieldAttributes.InitOnly) != 0)
+            || !CanEmitBefore(changed.Select(c => c.Value))) return null;
         var copy = NewLocal(structure);
         currentOutput!.Add(new ManagedAssignment(address, copy, source));
         foreach (var (field, value) in changed)
@@ -482,6 +517,13 @@ internal sealed partial class BodyBuilder
         var targetWidth = Width(target);
         switch (part)
         {
+            case OpSym { Op.Kind: OperatorKind.Select, Args: [var condition, var whenTrue, var whenFalse] } selected
+                when selected.Width <= targetWidth:
+                {
+                    if (IntegerBits(whenTrue, target, address) is not { } yes
+                        || IntegerBits(whenFalse, target, address) is not { } no) return null;
+                    return new ChoiceValue(View(condition, types.Boolean, address), yes, no, target, targetWidth);
+                }
             case OpSym operation when oracle.ModularArithmetic(operation) is { } carrier:
                 {
                     if (IntegerBits(operation.Args[0], carrier, address) is not { } left) return null;
@@ -498,6 +540,8 @@ internal sealed partial class BodyBuilder
                 return new ConstantValue(c.Value & Expr.Mask(targetWidth), target, targetWidth);
             case PhiSym phi when oracle.ProjectedScalar(phi) is var (scalar, scalarType, low):
                 return IntegerSlice(View(scalar, scalarType, address), low, phi.Width, target, address);
+            case PhiSym phi when oracle.IntegerPhiBits(phi):
+                return IntegerSlice(View(phi, types.Integer(phi.Width <= 32 ? 32 : 64, false), address), 0, phi.Width, target, address);
             case SliceSym slice when oracle.UntypedWidePhiPiece(slice) is { } widePiece:
                 return IntegerBits(widePiece, target, address);
             case SliceSym slice when oracle.EnclosingScalar(slice) is var (scalar, scalarType, low):

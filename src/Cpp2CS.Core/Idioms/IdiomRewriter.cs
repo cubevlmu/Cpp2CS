@@ -60,6 +60,8 @@ public sealed record TemplateInstance(Template Template, ulong Function, ulong H
 
 public sealed class IdiomResult
 {
+    /// <summary>已消费的初始化调用仍作为本图中的路径证明；不把任意置位写入当作初始化。</summary>
+    internal List<(Block Block, CallSite Site, ulong Slot)> MetadataInitializations { get; } = [];
     public List<TemplateInstance> Instances { get; } = [];
     public Dictionary<Template, int> Hits { get; } = new();
     public List<Residual> Residuals { get; } = [];
@@ -93,14 +95,16 @@ public sealed class IdiomRewriter(ProgramFacts facts)
     internal readonly ProgramFacts facts = facts;
     internal readonly ImageSection[] guardSections = facts.Model.Image.Sections
         .Where(s => (s.Flags & 1) != 0 && !s.Executable && s.Name != ".got").ToArray();
-    internal readonly ManagedAbi abi = new(facts.Layouts);
-    internal readonly Cpp2CS.Machine.Lifting.FactsCallModel calls = new(facts, new Arm64Machine(facts.Code).Convention);
+    internal readonly ManagedAbi abi = facts.CreateAbi();
+    internal readonly Cpp2CS.Machine.Lifting.FactsCallModel calls = new(facts, facts.CreateMachine().Convention);
     private Cpp2CS.Facts.Derived.NativeCalleeFacts? nativeCallees;
     internal Cpp2CS.Facts.Derived.NativeCalleeFacts NativeCallees => nativeCallees ??= new(facts, RecoverUnusedInputs);
     private Cpp2CS.Recovery.Calls.CallShapes? shapes;
     internal Cpp2CS.Recovery.Calls.CallShapes Shapes => shapes ??= new(facts, abi, (_, _) => false);
     private Cpp2CS.Recovery.Calls.CallMemoryEffects? callEffects;
-    internal Cpp2CS.Recovery.Calls.CallMemoryEffects CallEffects => callEffects ??= new(Shapes.Of, abi);
+    internal Cpp2CS.Recovery.Calls.CallMemoryEffects CallEffects => callEffects ??= new(Shapes.Of, abi,
+        runtimeStackRead: call => HelperOf(call) is { } helper && calls.Signature(helper.Address) is { } signature
+            && signature.Reads.All(r => r.Bank != Bank.Stack) ? 0 : null);
     internal bool UnusedInput(ulong entry, Storage register) => NativeCallees.UnusedInput(entry, register);
     internal bool UnusedResultBuffer(ulong entry) => NativeCallees.UnusedResultBuffer(entry);
 
@@ -113,8 +117,103 @@ public sealed class IdiomRewriter(ProgramFacts facts)
     /// <summary>恢复托管调用时清理未用输入的残值；事实推断仍保留原始调用参数。</summary>
     public bool RecoverUnusedInputs { get; init; }
 
-    public IdiomResult Run(MachineFunction function)
+    public IdiomResult Run(MachineFunction function, MethodRef? method = null)
     {
+        if (facts.Model.Image.Architecture == Architecture.X64)
+        {
+            var state = new IdiomState(this, function) { self = method };
+            // 使用本次恢复的实例身份，不能在共享入口的多个注册实例中任取一个。
+            if (method is not null && abi.Machine(method, out _)?.MethodInfo?.Register is { Bank: not Bank.Stack } methodInfo)
+                foreach (var block in function.Blocks)
+                    for (var i = 0; i < block.Statements.Count; i++)
+                        block.Statements[i] = ExprMap.MapOperands(block.Statements[i], e => ExprMap.Map(e, value =>
+                            value is Use { Variable.Version: 0 } input && input.Variable.Storage == methodInfo
+                                ? new Symbol(SymbolKind.Method, method) : null));
+            MetadataLoadsPass.Run(function, facts.Usages, state.Result, facts.Base.RuntimeOffsets?.ClassStaticFields, facts.Base.RuntimeOffsets?.MethodClass);
+            state.defs = new Defs(function);
+            state.Cleanup();
+            for (var round = 0; round < 16; round++)
+            {
+                MetadataLoadsPass.Run(function, facts.Usages, state.Result, facts.Base.RuntimeOffsets?.ClassStaticFields, facts.Base.RuntimeOffsets?.MethodClass);
+                state.defs = new Defs(function);
+                foreach (var block in function.Blocks)
+                    for (var i = 0; i < block.Statements.Count; i++)
+                    {
+                        if (block.Statements[i] is Call { Op: null } call && HelperOf(call)?.Kind == HelperKind.InitializedTypeInfo
+                            && state.Direct(block, i, call) is { } initialized) block.Statements[i] = initialized;
+                        if (block.Statements[i] is Call { Op: { Kind: OpKind.InitClass, Operand: null }, Arguments: [var subject] } init
+                            && state.defs.Expand(subject) is Symbol { Kind: SymbolKind.Class, Value: TypeRef type })
+                            block.Statements[i] = init with { Op = new RuntimeOp(OpKind.InitClass, type) };
+                    }
+                state.defs = new Defs(function);
+                var changed = state.GenericMetadataLoads();
+                changed |= NativeFieldAddresses.Run(state);
+                changed |= ClassInitializationFacts.Run(function, constructorFacts: method is { Method.Name: not ".cctor" },
+                    classFlagsOffset: facts.Base.RuntimeOffsets?.ClassInitializationFlags ?? -1,
+                    constructorFinishedOffset: facts.Base.RuntimeOffsets?.ClassCctorFinished ?? -1);
+                changed |= state.GuardFlagValues() | state.KnownMetadataGuards() | state.MetadataGuardOperands();
+                changed |= state.Guards();
+                // 元数据守卫不依赖 ARM64 类布局；类标志守卫仍由本机已核实偏移处理。
+                if (state.OnceGuards(metadataOnly: true))
+                {
+                    changed = true;
+                    state.Cleanup();
+                }
+                var knownTypeChecks = state.All.OfType<Call>().Where(c => c.Op?.Kind == OpKind.TypeCheck).Select(c => c.Site).ToHashSet();
+                if (state.TypeChecks() | state.CheckedTypeChains())
+                {
+                    state.Cleanup();
+                    SuccessfulTypeCheckValuesPass.Run(function, state.RawDefinition, state.Fresh, c => !knownTypeChecks.Contains(c.Site));
+                    changed = true;
+                }
+                changed |= state.Checks();
+                if (state.InvokerCalls())
+                {
+                    state.Cleanup();
+                    changed = true;
+                }
+                if (facts.Base.RuntimeOffsets?.ClassVtable == RuntimeLayout.ClassVtable
+                    && state.All.OfType<Call>().Any(c => HelperOf(c)?.Kind == HelperKind.InterfaceLookup))
+                {
+                    state.Cleanup();
+                    changed |= state.InterfaceDispatch();
+                }
+                // x64 初始化入口返回已解码的实体；消费 Direct 收集的结果，供下一轮类型与调用解析。
+                foreach (var block in function.Blocks)
+                    for (var i = 0; i < block.Statements.Count; i++)
+                        if (block.Statements[i] is Call { Op: null, Defines: [var metadataResult] } metadataCall
+                            && HelperOf(metadataCall)?.Kind == HelperKind.InitMetadata
+                            && function.Blocks.SelectMany(b => b.Statements).SelectMany(ExprMap.Operands).SelectMany(ExprMap.Walk)
+                                .OfType<Use>().Any(u => u.Variable == metadataResult))
+                            state.Direct(block, i, metadataCall);
+                if (state.lazyValues.Count > 0)
+                {
+                    state.ReplaceLazy();
+                    state.lazyValues.Clear();
+                    changed = true;
+                }
+                if (!changed) break;
+                state.Cleanup();
+            }
+            MetadataLoadsPass.Run(function, facts.Usages, state.Result, facts.Base.RuntimeOffsets?.ClassStaticFields, facts.Base.RuntimeOffsets?.MethodClass);
+            foreach (var block in function.Blocks)
+                for (var i = 0; i < block.Statements.Count; i++)
+                    if (block.Statements[i] is Call { Op: null } call && state.Direct(block, i, call) is { } rewritten)
+                        block.Statements[i] = rewritten;
+            if (state.lazyValues.Count > 0)
+            {
+                var guarded = state.Result.GuardSlots.Values.SelectMany(slots => slots).ToHashSet();
+                // 未证明的守卫中，未用返回值的调用继续保留；不凭 helper 名称删掉整个初始化路径。
+                state.lazyValues.RemoveAll(proof => !guarded.Contains(proof.Slot) && !proof.Call.Defines.Any(state.Used));
+                if (state.lazyValues.Count > 0) state.ReplaceLazy();
+                state.lazyValues.Clear();
+            }
+            state.RunPortable();
+            foreach (var call in state.All.OfType<Call>().Where(c => c.Op is null && HelperOf(c)?.Kind == HelperKind.InitMetadata))
+                state.Reject("metadata.unprojected", call.Address,
+                    $"槽位实参：{string.Join(", ", call.Arguments.Select(state.defs.Expand))}；返回定义：{string.Join(", ", call.Defines.Select(v => v.ToString()))}；槽位身份已知：{call.Arguments.FirstOrDefault() is { } arg && state.defs.Expand(arg) is Const address && facts.Usages.At(address.Value) is not null}");
+            return state.Result;
+        }
         IdiomState context = new IdiomState(this, function);
         context.Run();
         return context.Result;
@@ -135,6 +234,20 @@ public sealed class IdiomRewriter(ProgramFacts facts)
         state.defs = new Defs(function);
         SuccessfulTypeCheckValuesPass.Run(function, state.RawDefinition, state.Fresh, c => !known.Contains(c.Site));
         return true;
+    }
+
+    /// <summary>调用签名确定并清除纯残值后，重新核对原有守卫；沿用完整形态与合流证明。</summary>
+    internal void ResumeGuards(MachineFunction function, MethodRef method, IdiomResult result)
+    {
+        var state = new IdiomState(this, function, result) { self = method };
+        state.Cleanup();
+        for (var round = 0; round < 16; round++)
+        {
+            var changed = state.Guards();
+            if (facts.Model.Image.Architecture == Architecture.X64) changed |= state.OnceGuards(metadataOnly: true);
+            if (!changed) break;
+            state.Cleanup();
+        }
     }
 
     /// <summary>调用目标是运行时 helper（不含托管区域中没有注册表所有者的生成函数，它们按托管调用处理）。</summary>

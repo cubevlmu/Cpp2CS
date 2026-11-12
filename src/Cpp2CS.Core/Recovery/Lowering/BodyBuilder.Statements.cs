@@ -120,7 +120,13 @@ internal sealed partial class BodyBuilder
     /// </summary>
     private void StoreTo(Location place, Sym bits, ulong address, List<ManagedStatement> output)
     {
-        if (Leafwise(bits, place.Type) && oracle.FieldValues(bits, (DefinitionRef)place.Type) is { } fields)
+        // 构造体对 this 的合并初始化须直接写回字段，不能先构造同类型临时值而递归证明自身。
+        var initializesThis = analysis.Method.Method is { Name: ".ctor", IsStatic: false }
+            && place.Path.Count == 0 && place.Base is ArgSym { Index: -1 } && place.Type.Equals(analysis.Method.DeclaringType)
+            && place.Type is DefinitionRef structure && types.Kind(structure) == TypeKind.Struct
+            && oracle.FieldStores(bits, structure) is { } leaves
+            && leaves.Any(l => l.Path.Any(f => (f.Field.Attributes & System.Reflection.FieldAttributes.InitOnly) != 0));
+        if ((initializesThis || Leafwise(bits, place.Type)) && oracle.FieldValues(bits, (DefinitionRef)place.Type) is { } fields)
         {
             foreach (var (projection, part) in fields)
                 StoreTo(place with { Path = [.. place.Path, .. projection.Path], Type = projection.Type }, part, address, output);

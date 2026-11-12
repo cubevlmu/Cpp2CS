@@ -16,6 +16,7 @@ internal static class DispatchResolution
     public static int Run(MachineFunction function, ValueModel values, TypeOracle oracle)
     {
         var targets = Find(function, values, oracle);
+        PreserveDiscardedInputs(function, targets, oracle.CallShape);
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
                 if (block.Statements[i] is Call call && targets.TryGetValue(call.Site, out var method))
@@ -31,16 +32,25 @@ internal static class DispatchResolution
         {
             MethodRef? method = call.Op switch
             {
+                null when call.Kind is CallKind.Direct or CallKind.Tail => oracle.DirectMethodInfo(call) ?? oracle.FreshConstructor(call) ?? oracle.DirectReceiver(call) ?? oracle.ErasedOverload(call),
                 null when call.Kind is CallKind.Indirect or CallKind.TailIndirect => MethodPointer(values.Operands(call)[0]) ?? SplitDispatch(call, values, oracle),
                 { Kind: OpKind.CallMethodPointer } => MethodPointer(values.Operands(call)[0]),
                 { Kind: OpKind.CallDelegate, Operand: MethodRef invoke } => invoke,
                 { Kind: OpKind.CallInterface, Operand: ValueTuple<object?, int> { Item1: DefinitionRef itf } pair } => Slot(itf, pair.Item2, interfaceOnly: true),
-                { Kind: OpKind.CallVirtual, Operand: int slot } when Receiver(call, values) is { } receiver => VirtualSlot(oracle.TypeOf(receiver), slot, oracle.Types, oracle.Substitute),
+                { Kind: OpKind.CallVirtual, Operand: int slot } when Receiver(call, values, oracle, slot) is { } receiver => VirtualSlot(oracle.TypeOf(receiver), slot, oracle.Types, oracle.Substitute),
                 _ => null,
             };
             if (method is not null) targets.Add(call.Site, method);
         }
         return targets;
+    }
+
+    internal static void PreserveDiscardedInputs(MachineFunction function, IReadOnlyDictionary<CallSite, MethodRef> targets, Func<Call, CallShape> shapes)
+    {
+        foreach (var call in function.Blocks.SelectMany(b => b.Statements).OfType<Call>().ToArray())
+            if (targets.TryGetValue(call.Site, out var target)
+                && shapes(call).Candidates.Any(c => c.Method.Parameters.Count > target.Method.Parameters.Count))
+                Machine.Ssa.ReadEffects.PreserveInputs(function, call.Arguments);
     }
 
     /// <summary>符号求值已确定 MethodInfo 时，偏移零的 methodPointer 读取指向该方法。</summary>
@@ -58,19 +68,41 @@ internal static class DispatchResolution
     private static MethodRef? SplitDispatch(Call call, ValueModel values, TypeOracle oracle)
     {
         if (SymTable.Resolve(values.Operands(call)[0]) is not ReadSym { Width: 64 } target) return null;
-        if (SymTable.Resolve(target.Address) is ResultSym { Site: Call { Op: { Kind: OpKind.InterfaceInvokeData, Operand: ValueTuple<object?, int> { Item1: DefinitionRef itf } lookup } } })
-            return Slot(itf, lookup.Item2, interfaceOnly: true);
+        if (SymTable.Resolve(target.Address) is ResultSym { Site: Call { Op: { Kind: OpKind.InterfaceInvokeData, Operand: ValueTuple<object?, int> { Item1: DefinitionRef itf } lookup } } lookupCall })
+        {
+            var contract = Slot(itf, lookup.Item2, interfaceOnly: true);
+            if (contract is null || oracle.Types.Model.Image.Architecture != Architecture.X64) return contract;
+            // 查找 A 的实现后不能把 B 作为 this 转成 B 的接口虚调用。
+            if (oracle.NativeSignature(contract)?.This?.Pieces is not [{ Register: var interfaceReceiver }]
+                || call.ArgumentIndex(interfaceReceiver) is not (var position and >= 0) || lookupCall.Arguments.Length == 0) return null;
+            return ReferenceEquals(SymTable.Resolve(values.Operands(call)[position + 1]),
+                SymTable.Resolve(values.Operands(lookupCall)[1])) ? contract : null;
+        }
         if (oracle.Decompose(target.Address) is (ResultSym { Site: Call { Op: { Kind: OpKind.ResolveGenericVirtual, Operand: MethodRef generic } } }, RuntimeLayout.MethodVirtualPointer, null, _))
             return generic;
-        return oracle.Decompose(target.Address) is (_, var offset, null, _) && offset >= RuntimeLayout.ClassVtable
-            && (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize == 0 && Receiver(call, values) is { } receiver
+        return oracle.VtableOffset is { } vtable && oracle.Decompose(target.Address) is (_, var offset, null, _)
+            && offset >= vtable && (offset - vtable) % RuntimeLayout.VirtualInvokeDataSize == 0
+            && Receiver(call, values, oracle) is { } receiver
             ? oracle.VirtualMethod(target, receiver) : null;
     }
 
-    private static Sym? Receiver(Call call, ValueModel values)
+    private static Sym? Receiver(Call call, ValueModel values, TypeOracle oracle, int? slot = null)
     {
-        var position = Array.IndexOf(call.Sources, Storage.Gpr(0));
-        return position < 0 ? null : values.Operands(call)[1 + position];
+        Sym? Register(Storage storage) => Array.IndexOf(call.Sources, storage) is var position and >= 0
+            ? values.Operands(call)[1 + position] : null;
+        if (oracle.Types.Model.Image.Architecture == Architecture.Arm64) return Register(Storage.Gpr(0));
+        // Win64 的结构返回缓冲区可能占用 RCX；先证明虚表所属对象，再核对目标 ABI 的 this 位置。
+        if (slot is null && SymTable.Resolve(values.Operands(call)[0]) is ReadSym target
+            && oracle.ClassOwner(oracle.Decompose(target.Address).Root) is { } owner
+            && oracle.VirtualMethod(target, owner) is { } method
+            && oracle.NativeSignature(method)?.This?.Pieces is [{ Register: var self }]
+            && Register(self) is { } actual && ReferenceEquals(SymTable.Resolve(actual), SymTable.Resolve(owner))) return owner;
+        if (slot is null) return null;
+        var matches = new List<Sym>();
+        foreach (var register in new[] { Storage.Gpr(1), Storage.Gpr(2) })
+            if (Register(register) is { } value && VirtualSlot(oracle.TypeOf(value), slot.Value, oracle.Types, oracle.Substitute) is { } candidate
+                && oracle.NativeSignature(candidate)?.This?.Pieces is [{ Register: var candidateSelf }] && candidateSelf == register) matches.Add(value);
+        return matches.Count == 1 ? matches[0] : null;
     }
 
     /// <summary>类型（沿基类链）中占据虚表槽 slot 的虚方法，类型实参代入声明类型。</summary>

@@ -41,8 +41,12 @@ internal sealed class MemoryPromotion
     private readonly MachineSignature signature;
     private readonly Func<Call, CallShape> shapes;
     private readonly ManagedAbi abi;
+    private readonly CallInputSnapshots inputs;
     private readonly Dictionary<Variable, Expr> definitions = [];
+    private readonly Dictionary<Variable, Phi> addressPhis = [];
+    private readonly HashSet<Variable> resolvingPhis = [];
     private readonly Dictionary<Storage, LocalSpace> pointers = [];
+    private readonly Dictionary<Variable, LocalSpace> stackCopies = [];
     private readonly List<Access> accesses = [];
 
     private MemoryPromotion(MachineFunction function, MachineSignature signature, Func<Call, CallShape> shapes, ManagedAbi abi)
@@ -51,6 +55,7 @@ internal sealed class MemoryPromotion
         this.signature = signature;
         this.shapes = shapes;
         this.abi = abi;
+        inputs = new(function);
         foreach (var value in signature.Arguments.Where(a => a.Transfer == Transfer.Copy && a.Pieces[0].Register.Bank == Bank.Gpr))
             pointers[value.Pieces[0].Register] = LocalSpace.Copy(value.Index);
         if (signature.Return is { Transfer: Transfer.ResultBuffer } result && result.Pieces[0].Register.Bank == Bank.Gpr)
@@ -62,7 +67,8 @@ internal sealed class MemoryPromotion
     {
         var promotion = new MemoryPromotion(function, signature, shapes, abi);
         promotion.TrimUnusedCallStacks();
-        if (Machine.Storage.FrameForwarding.Run(function, new CallMemoryEffects(shapes, abi, settled: true))) Propagate.Run(function, Dominators.Compute(function));
+        if (Machine.Storage.FrameForwarding.Run(function, new CallMemoryEffects(shapes, abi, settled: true,
+            unusedSnapshot: (call, index) => promotion.inputs.Contains(shapes(call), index)))) Propagate.Run(function, Dominators.Compute(function));
         var layout = promotion.Partition();
         if (layout.Cells.Count == 0) return layout;
         if (signature.Return is { Transfer: Transfer.ResultBuffer, Size: > 0 } && layout.Cells.Any(c => c.Space == LocalSpace.Result && !c.Promoted))
@@ -106,11 +112,31 @@ internal sealed class MemoryPromotion
             StackAllocation a => (LocalSpace.Dynamic(a.Site, a.Element), 0),
             Entry { Storage: var s } when pointers.TryGetValue(s, out var space) => (space, 0),
             Use { Variable: { Version: 0 } v } when pointers.TryGetValue(v.Storage, out var space) => (space, 0),
+            Use { Variable: var v, Width: 64 } when stackCopies.TryGetValue(v, out var space) => (space, 0),
             Use { Variable: var v, Width: 64 } when definitions.TryGetValue(v, out var value) => Resolve(value, depth + 1),
+            Use { Variable: var v, Width: 64 } when addressPhis.TryGetValue(v, out var phi) => ResolvePhi(phi, depth + 1),
             Binary { Op: BinOp.Add, Right: Const c } b when Resolve(b.Left, depth + 1) is var (space, offset) => (space, offset + unchecked((long)c.Value)),
             Binary { Op: BinOp.Sub, Right: Const c } b when Resolve(b.Left, depth + 1) is var (space, offset) => (space, offset - unchecked((long)c.Value)),
             _ => null,
         };
+    }
+
+    private (LocalSpace Space, long Offset)? ResolvePhi(Phi phi, int depth)
+    {
+        if (depth > 16 || phi.Sources.Length == 0 || !resolvingPhis.Add(phi.Target)) return null;
+        (LocalSpace Space, long Offset)? common = null;
+        foreach (var source in phi.Sources)
+        {
+            var current = source is null ? null : Resolve(new Use(source, 64), depth);
+            if (current is null || common is not null && current != common)
+            {
+                resolvingPhis.Remove(phi.Target);
+                return null;
+            }
+            common = current;
+        }
+        resolvingPhis.Remove(phi.Target);
+        return common;
     }
 
     // ---- 收集 ----
@@ -122,6 +148,8 @@ internal sealed class MemoryPromotion
         foreach (var block in function.Blocks)
             foreach (var statement in block.Statements)
                 if (statement is Define define) definitions[define.Target] = define.Value;
+                else if (statement is Phi { Target.Width: 64 } phi) addressPhis[phi.Target] = phi;
+        FindStackCopies();
         foreach (var block in function.Blocks)
             foreach (var statement in block.Statements)
                 Collect(statement);
@@ -148,6 +176,32 @@ internal sealed class MemoryPromotion
         return new MemoryLayout(cells);
     }
 
+    /// <summary>栈传入的副本指针必须在读取点仍来自入口；保留读取快照，不把后续同槽读取当成同一指针。</summary>
+    private void FindStackCopies()
+    {
+        var incoming = signature.Arguments.Where(a => a.Transfer == Transfer.Copy)
+            .SelectMany(a => a.Pieces.Where(p => p.Register.Bank == Bank.Stack && p.Width == 64)
+                .Select(p => (Offset: (long)p.Register.Index, Space: LocalSpace.Copy(a.Index)))).ToArray();
+        if (incoming.Length == 0) return;
+        var effects = new CallMemoryEffects(shapes, abi, settled: true,
+            unusedSnapshot: (call, index) => inputs.Contains(shapes(call), index));
+        var frame = new Machine.Storage.FrameModel(function, effects);
+        // 槽内保存的指针也可能经槽地址被调用读取；尚未建模这种间接逃逸时不提升副本。
+        incoming = incoming.Where(copy => !frame.Escaped(copy.Offset, 8)
+            && !function.Blocks.SelectMany(b => b.Statements).OfType<Call>().Any(call =>
+                call.Arguments.Select((arg, index) => (Argument: arg, Use: effects.Argument(call, index)))
+                    .Any(a => a.Use.Size != 0 && frame.Targets(a.Argument).Any(start => start <= copy.Offset + 7
+                        && (a.Use.Size < 0 || start > long.MaxValue - a.Use.Size || start + a.Use.Size > copy.Offset))))).ToArray();
+        if (incoming.Length == 0) return;
+        foreach (var block in function.Blocks)
+            for (var index = 0; index < block.Statements.Count; index++)
+                if (block.Statements[index] is Define { Value: Load { Width: 64 } load } define
+                    && Resolve(load.Address) is (var space, var offset) && space == LocalSpace.Frame)
+                    foreach (var copy in incoming.Where(p => p.Offset == offset))
+                        if (frame.Reach(block, index, offset, 8) is { FromEntry: true, Stores.Count: 0, Clobber: null, Exhausted: false })
+                            stackCopies[define.Target] = copy.Space;
+    }
+
     private static Cell Make(int id, LocalSpace space, long start, long end, string? escape) =>
         new(id, space, start, checked((int)(end - start)), escape ?? (end - start > 4096 ? "单元超过 4096 字节" : null));
 
@@ -162,6 +216,7 @@ internal sealed class MemoryPromotion
                 if (Resolve(define.Value) is null) Walk(define.Value, "参与运算");
                 break;
             case Phi phi:
+                if (phi.Target.Width == 64 && Resolve(new Use(phi.Target, 64)) is not null) break;
                 foreach (var source in phi.Sources)
                     if (source is not null && Resolve(new Use(source, 64)) is var (space, offset)) Escape(space, offset, "进入 φ");
                 break;
@@ -193,7 +248,8 @@ internal sealed class MemoryPromotion
                     // 隐藏 MethodInfo 的寄存器只传方法指针，里面残留的旧值不是实参。
                     if (shapes(call).Signature?.MethodInfo is { } hidden && call.ArgumentIndex(hidden.Register) is >= 0 and var slot) covered.Add(slot);
                     for (var i = 0; i < call.Arguments.Length; i++)
-                        if (!covered.Contains(i)) Walk(call.Arguments[i], shapes(call) is { Signature: null, IsRuntime: false } ? "未知调用的实参" : "调用实参");
+                        if (!covered.Contains(i) && !inputs.Contains(shapes(call), i))
+                            Walk(call.Arguments[i], shapes(call) is { Signature: null, IsRuntime: false } ? "未知调用的实参" : "调用实参");
                     if (call.DelegateReceiver is { } receiver) Walk(receiver, "委托接收者");
                     break;
                 }

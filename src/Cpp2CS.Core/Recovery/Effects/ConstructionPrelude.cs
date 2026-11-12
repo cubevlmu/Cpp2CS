@@ -29,7 +29,8 @@ internal static class ConstructionPrelude
             var operands = values.Operands(statement);
             if (statement is Define && values.ReadsAt(statement).Count == 0 || statement is Nop) continue;
             if (statement is Store && oracle.Decompose(operands[0]).Root == result && !Contains(operands[1])) continue;
-            if (statement is Call { Op.Kind: OpKind.WriteBarrier } && oracle.Decompose(operands[1]).Root == result && !Contains(operands[2])) continue;
+            if (statement is Call { Op.Kind: OpKind.WriteBarrier } && oracle.Decompose(operands[1]).Root == result
+                && (operands.Count == 2 || !Contains(operands[2]))) continue;
             if (statement is not Call call || analysis.Environment.Shape(call).Signature?.This is not { } receiver
                 || oracle.Callee(call) is not { Method: { Name: ".ctor", IsStatic: false }, DeclaringType: DefinitionRef declaring } constructor
                 || declaring.Definition == allocated.Definition) return null;

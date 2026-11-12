@@ -5,18 +5,29 @@ internal sealed record ValueConstruction(MethodRef Constructor, IReadOnlyList<Ma
 
 internal sealed partial class TemplateRecovery
 {
-    private sealed record ValueConstructorEvidence(MethodRef Method, IReadOnlyList<(IReadOnlyList<FieldRef> Path, ManagedValue Value)> Writes);
+    private sealed record ValueConstructorEvidence(MethodRef Method, IReadOnlyList<(IReadOnlyList<FieldRef> Path, ManagedValue Value)> Writes)
+    {
+        public IReadOnlyList<(ManagedValue Condition, bool Truth)> Conditions { get; init; } = [];
+    }
     private readonly Dictionary<DefinitionRef, ValueConstructorEvidence[]> valueConstructors = [];
 
     /// <summary>构造体纯粹写入全部叶子，且写入值为形参、经 ref 形参的读取或常量。</summary>
     private ValueConstructorEvidence[] ValueConstructors(DefinitionRef structure)
     {
         if (valueConstructors.TryGetValue(structure, out var known)) return known;
+        valueConstructors[structure] = [];
         var candidates = new List<ValueConstructorEvidence>();
         foreach (var definition in structure.Definition.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic && m.GenericParameters.Count == 0))
         {
             var method = new MethodRef(definition, structure.Arguments, []);
-            if (ConstructorWrites(method) is not { Count: > 0 } writes) continue;
+            if (!ManagedAccess.Method(types, caller.Method.Owner, method, null)) continue;
+            if ((definition.Owner.Attributes & System.Reflection.TypeAttributes.BeforeFieldInit) == 0
+                && definition.Owner.Methods.Any(m => m.Name == ".cctor")) continue;
+            if (ConstructorWrites(method) is not { Count: > 0 } writes)
+            {
+                candidates.AddRange(ValueConstructorPaths(method, structure));
+                continue;
+            }
             if (writes.All(w => w.Value is ConstantValue or ArgumentValue { Index: >= 0 }
                     or IndirectValue { Address: ArgumentValue { Index: >= 0, Type: ByRefRef } })
                 && types.Leaves(structure).All(l => writes.Any(w => FieldPrefix(w.Path, l.Path))))
@@ -37,6 +48,7 @@ internal sealed partial class TemplateRecovery
         {
             var (method, writes) = candidate;
             var binding = new Dictionary<int, ManagedValue>();
+            var pieces = new Dictionary<int, List<(IReadOnlyList<FieldRef> Path, ManagedValue Value)>>();
             var valid = true;
             foreach (var (path, written) in writes)
             {
@@ -55,9 +67,19 @@ internal sealed partial class TemplateRecovery
                         && desired is LocalValue or ArgumentValue or FieldValue or StaticFieldValue or ArrayElementValue
                         && Unify(argument, new AddressValue(desired), binding),
                     ArgumentValue { Index: >= 0 } => Unify(written, desired, binding),
+                    FieldValue => BindConstructorPiece(written, desired, pieces),
                     _ => false,
                 };
                 if (!valid) break;
+            }
+            foreach (var (condition, truth) in candidate.Conditions)
+                if (!BindConstructorCondition(condition, truth, pieces)) { valid = false; break; }
+            foreach (var (index, parts) in pieces)
+            {
+                var parameter = method.Concrete(method.Method.Parameters[index].Type);
+                if (parameter is not DefinitionRef aggregate || ConstructorArgument(aggregate, parts) is not { } argument
+                    || binding.TryGetValue(index, out var bound) && !SameTerm(bound, argument)) { valid = false; break; }
+                binding[index] = argument;
             }
             if (!valid || Enumerable.Range(0, method.Method.Parameters.Count).Any(i => !binding.ContainsKey(i))
                 || !leaves.All(f => writes.Any(w => FieldPrefix(w.Path, f.Path)))) continue;

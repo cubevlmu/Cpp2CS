@@ -62,9 +62,23 @@ public sealed partial class TypeOracle
 
     /// <summary>各入边都是相邻字段合并的宽读取、自身没有类型的合流只是搬运；它的片按各入边的片合流，类型由字段给出。</summary>
     public PhiSym? UntypedWidePhiPiece(SliceSym slice) =>
-        slice.Base is PhiSym { Projection: null, Width: > 64 } phi && TypeOf(phi) is null
+        slice.Base is PhiSym { Projection: null, Width: >= 64 } phi && TypeOf(phi) is null
         && phi.Sources.All(s => s is not null && SymTable.Resolve(s) is ReadSym read && Parts(read) is not null)
             ? values.Syms.Projection(phi, slice.Low, slice.Width) : null;
+
+    /// <summary>非标准宽度的整数合流只承载已定义的标量位片；不猜测引用、填充或未知入边。</summary>
+    public bool IntegerPhiBits(PhiSym phi) => phi.Width is > 1 and < 64 and not (8 or 16 or 32)
+        && TypeOf(phi) is null && phi.Sources.Length > 0 && phi.Sources.All(source => source is not null && ScalarPiece(SymTable.Resolve(source)));
+
+    private bool ScalarPiece(Sym source) => source switch
+    {
+        ConstSym => true,
+        SliceSym slice when EnclosingScalar(slice) is not null => true,
+        SliceSym slice when slice.Base is ArgSym or ReadSym => ScalarPiece(slice.Base) && IntegerRepresentation(slice.Base) is not null,
+        ArgSym or ReadSym => TypeOf(source) is { } type && types.Kind(type) is TypeKind.Int or TypeKind.Bool or TypeKind.Float or TypeKind.Double
+            && types.Bits(type) >= source.Width,
+        _ => false,
+    };
 
     private bool ScalarBits(Sym value, HashSet<Sym> seen)
     {
@@ -118,13 +132,16 @@ public sealed partial class TypeOracle
     /// 托管数组下标的来源：去掉比例寻址丢弃的高位与 32 位扩展，供元素访问和边界检查共同使用。
     /// 这些表示仅在数组的越界语义下等价，不用于非托管指针的字节偏移。
     /// </summary>
-    public static Sym ArrayIndex(Sym index)
+    internal Sym ArrayIndexValue(Sym index) => ArrayIndex(index, value => ScalarBits(value, []));
+
+    public static Sym ArrayIndex(Sym index, Func<Sym, bool>? scalar = null)
     {
         while (true)
         {
             index = SymTable.Resolve(index);
-            if (index is SliceSym { Low: 0, Width: >= 32 } slice && slice.Base.Width > slice.Width) index = slice.Base;
-            else if (index is PhiSym { Projection: { Low: 0 } projection, Width: >= 32 } phi && projection.Whole.Width > phi.Width) index = projection.Whole;
+            // 结构体的低位可能是下标字段，不能把字段投影去掉而留下整个结构体。
+            if (index is SliceSym { Low: 0, Width: >= 32 } slice && slice.Base.Width > slice.Width && scalar?.Invoke(slice.Base) != false) index = slice.Base;
+            else if (index is PhiSym { Projection: { Low: 0 } projection, Width: >= 32 } phi && projection.Whole.Width > phi.Width && scalar?.Invoke(projection.Whole) != false) index = projection.Whole;
             else if (index is OpSym { Op: { Kind: OperatorKind.Convert } op, Args: [{ Width: 32 } narrow] } && op.Conversion == ConvKind.SignExtend) index = narrow;
             else if (index is ConcatSym { Parts: [{ Width: 32 } low, ConstSym { Value: 0 }] }) index = low;
             else return index;

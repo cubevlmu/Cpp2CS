@@ -3,7 +3,7 @@ using Cpp2CS.Ir;
 
 namespace Cpp2CS.Idioms;
 
-/// <summary>libm 的有界栈出参调用；显式保留输出值及写入顺序。</summary>
+/// <summary>C 数学库调用归一；显式保留出参值及写入顺序。</summary>
 internal static class MathImportNormalizer
 {
     // C11 / POSIX modf：https://man7.org/linux/man-pages/man3/modf.3.html
@@ -15,7 +15,7 @@ internal static class MathImportNormalizer
         return new Select(new Compare(Cond.FEq, input, integral), signedZero, new Binary(BinOp.FSub, input, integral, 64), 64);
     }
 
-    internal static bool Run(MachineFunction function, Func<Variable> fresh)
+    internal static bool Run(MachineFunction function, Func<Variable> fresh, bool win64 = false)
     {
         var changed = false;
         foreach (var block in function.Blocks)
@@ -25,7 +25,7 @@ internal static class MathImportNormalizer
                 if (block.Statements[i] is Call { Op: { Kind: OpKind.Import, Operand: string name } } scalar
                     && MathImportSignature.Find(name) is { } signature)
                 {
-                    var sources = Enumerable.Range(0, signature.Parameters.Length).Select(signature.Register).ToArray();
+                    var sources = Enumerable.Range(0, signature.Parameters.Length).Select(n => signature.Register(n, win64)).ToArray();
                     var positions = sources.Select(scalar.ArgumentIndex).ToArray();
                     if (positions.Any(p => p < 0)) continue;
                     var arguments = positions.Select((p, n) => Fold.Convert(ConvKind.Truncate, scalar.Arguments[p],
@@ -62,18 +62,22 @@ internal static class MathImportNormalizer
                 if (block.Statements[i] is not Call
                     {
                         Kind: CallKind.Direct, Op: { Kind: OpKind.Import, Operand: "modf" },
-                        Arguments: [FrameAddress { Offset: < 0 } frame, var operand],
+                        Arguments: [var destination, var operand],
                         Results: [var register], Defines: [{ } result]
                     } call || register != Storage.Vec(0)
-                    || frame.Offset + 8 > 0 || operand.Width < 64) continue;
+                    || destination is not (FrameAddress or StackAllocation or Use) || destination.Width != 64 || operand.Width < 64) continue;
                 var input = fresh(); var integral = fresh();
                 var value = new Use(input, 64); var integer = new Use(integral, 64);
+                var fraction = Fraction(value, integer);
+                // 标量只定义低 64 位；XMM 的其余位仍是调用破坏值，SSA 定义保持寄存器宽度。
+                Expr returned = result.Width == 64 ? fraction
+                    : new Insert(new Unknown("modf 返回寄存器高位未定义", result.Width), fraction, 0);
                 block.Statements.RemoveAt(i);
                 block.Statements.InsertRange(i, [
                     new Define(call.Address, input, Fold.Convert(ConvKind.Truncate, operand, 64)),
                     new Define(call.Address, integral, new Unary(UnOp.FTrunc, value, 64)),
-                    new Store(call.Address, frame, integer),
-                    new Define(call.Address, result, Fraction(value, integer)),
+                    new Store(call.Address, destination, integer),
+                    new Define(call.Address, result, returned),
                 ]);
                 i += 3;
                 changed = true;

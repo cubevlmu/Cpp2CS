@@ -115,6 +115,7 @@ public static class Fold
             {
                 case UnOp.Neg: return C((ulong)-(long)c.Value, width);
                 case UnOp.Not: return C(~c.Value, width);
+                case UnOp.PopCount: return C((ulong)System.Numerics.BitOperations.PopCount(c.Value & Mask(c.Width)), width);
             }
         }
         if (op is UnOp.Not or UnOp.Neg && operand is Unary inner && inner.Op == op) return inner.Operand;
@@ -234,6 +235,11 @@ public static class Fold
             return Compare(cond, z.Operand, C(k.Value, z.Operand.Width));
         if (cond is Cond.Eq or Cond.Ne && left is Convert { Kind: ConvKind.ZeroExtend } z1 && z1.Operand.Width == 1 && right is Const k1)
             return k1.Value == 0 == (cond == Cond.Ne) ? z1.Operand : Not(z1.Operand);
+        // 同宽整数减法的零测试等价于操作数相等；不推广到截断减法或有序比较。
+        if (cond is Cond.Eq or Cond.Ne && right is Const { Value: 0 }
+            && left is Binary { Op: BinOp.Sub } difference && difference.Width == difference.Left.Width
+            && difference.Width == difference.Right.Width && right.Width == difference.Width)
+            return Compare(cond, difference.Left, difference.Right);
         // 合并的零测试也适用于引用判空；只拆快照和常量，短路不能省略原有读取。
         if (cond is Cond.Eq or Cond.Ne && right is Const { Value: 0 }
             && left is Binary { Op: BinOp.Or, Left: Use or Const, Right: Use or Const } either)

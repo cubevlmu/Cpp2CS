@@ -22,6 +22,8 @@ public sealed record AbiValue(TypeRef Type, Passing Passing, AbiPiece[] Pieces);
 /// <summary>托管方法在机器上的签名。This 为实例方法的接收者（值类型为指向数据的指针），Return 为 null 表示 void。</summary>
 public sealed record AbiSignature(AbiValue? This, AbiValue[] Parameters, AbiPiece? MethodInfo, AbiValue? Return)
 {
+    /// <summary>间接返回时回传结果缓冲区地址的寄存器；没有此 ABI 契约时为 null。</summary>
+    public Storage? BufferPointerResult { get; init; }
     public IEnumerable<AbiValue> Arguments => This is null ? Parameters : [This, .. Parameters];
 
     /// <summary>调用读取的寄存器：参数、MethodInfo 及间接返回缓冲区。</summary>
@@ -29,8 +31,9 @@ public sealed record AbiSignature(AbiValue? This, AbiValue[] Parameters, AbiPiec
         .. MethodInfo is { } m ? [m.Register] : Array.Empty<Storage>(),
         .. Return is { Passing: Passing.Indirect } r ? [r.Pieces[0].Register] : Array.Empty<Storage>()];
 
-    /// <summary>调用写出结果的寄存器（间接返回时没有）。</summary>
-    public Storage[] Results => Return is { Passing: Passing.Registers } r ? r.Pieces.Select(p => p.Register).Distinct().ToArray() : [];
+    /// <summary>调用写出结果的寄存器，含 ABI 规定回传的缓冲区地址。</summary>
+    public Storage[] Results => Return is { Passing: Passing.Registers } r ? r.Pieces.Select(p => p.Register).Distinct().ToArray()
+        : Return is { Passing: Passing.Indirect } && BufferPointerResult is { } pointer ? [pointer] : [];
 }
 
 /// <summary>值的寄存器类别。</summary>
@@ -44,7 +47,7 @@ public enum ValueKind { Void, Integer, Reference, Float, Double, Struct }
 /// 完全共享的类型参数占一个整数寄存器；其返回缓冲区放在显式参数之后、MethodInfo 之前。
 /// 大小与成员布局取自 <see cref="FieldLayouts"/>；缺少原生实例见证的开放类型参数无法分类（返回 null）。
 /// </summary>
-public sealed partial class ManagedAbi(ITypeLayouts layouts)
+public sealed partial class ManagedAbi(ITypeLayouts layouts, Architecture architecture = Architecture.Arm64)
 {
     private const int Registers = 8;
 
@@ -97,6 +100,7 @@ public sealed partial class ManagedAbi(ITypeLayouts layouts)
     /// <summary>签名中的类型以 method 的实参代入。无法分类时返回 null 并给出原因。</summary>
     public AbiSignature? Classify(MethodRef method, out string? problem)
     {
+        if (architecture == Architecture.X64) return ClassifyWin64(method, out problem);
         problem = null;
         var definition = method.Method;
         TypeRef Concrete(TypeRef type) => type.Substitute(method.TypeArguments, method.MethodArguments);
@@ -196,6 +200,7 @@ public sealed partial class ManagedAbi(ITypeLayouts layouts)
 
     public AbiValue? ClassifyReturn(TypeRef type, out string? problem)
     {
+        if (architecture == Architecture.X64) return Win64Return(type, out problem);
         problem = null;
         switch (Kind(type))
         {

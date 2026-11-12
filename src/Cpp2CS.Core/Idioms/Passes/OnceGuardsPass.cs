@@ -17,11 +17,12 @@ internal static class OnceGuardsPass
     private sealed record Guard(Kind Kind, Block Initialize, Block Skip, TypeRef? Type, ulong Flag);
 
     /// <summary>折叠一个守卫；调用方在清理后继续寻找下一个。</summary>
-    internal static bool OnceGuards(this IdiomState state)
+    internal static bool OnceGuards(this IdiomState state, bool metadataOnly = false)
     {
         foreach (var head in state.function.Blocks)
         {
-            if (state.removed.Contains(head) || head.Statements.LastOrDefault() is not Branch branch || Recognize(state, head, branch) is not { } guard) continue;
+            if (state.removed.Contains(head) || head.Statements.LastOrDefault() is not Branch branch || Recognize(state, head, branch) is not { } guard
+                || metadataOnly && guard.Kind != Kind.Metadata) continue;
             var proof = new Proof(state, head, guard);
             if (!proof.Holds(out var reason))
             {
@@ -29,6 +30,7 @@ internal static class OnceGuardsPass
                 continue;
             }
             if (guard.Kind == Kind.Metadata) proof.CommitMetadata(branch);
+            foreach (var read in TopLoadsPass.TopLoads(state.defs.Expand(branch.Condition))) state.ReleaseGuardRead(read);
             head.Statements[^1] = new Jump(branch.Address, guard.Initialize.Start);
             MachineFunction.RemoveEdge(head, guard.Skip);
             return true;
@@ -96,7 +98,7 @@ internal static class OnceGuardsPass
             if (merge is null && fast.Exit is null && fast.Returned is null) { reason = "快路径没有终点"; return false; }
             if (!Walk(taken, guard.Initialize, true, merge, out reason)) return false;
             // 同一标志的前一个守卫已经初始化时，这一臂的调用被清理掉，只剩写标志。
-            if (!taken.Initialized && taken.FlagStore is null) { reason = "慢路径没有初始化"; return false; }
+            if (!taken.Initialized && !state.Result.GuardSlots.TryGetValue(guard.Flag, out _)) { reason = "慢路径没有已证明的初始化"; return false; }
             if (loadAfterStore) { reason = "写入之后还有读取"; return false; }
             if (fast.Stores.Count != taken.Stores.Count || !fast.Stores.SequenceEqual(taken.Stores)) { reason = "两臂的写入不同"; return false; }
             if (merge is not null)
@@ -109,12 +111,9 @@ internal static class OnceGuardsPass
                     var width = Observed(phi.Target, []);
                     if (width == 0 || phi.Sources.Length != merge.Predecessors.Count) continue;
                     var (skipped, initialized) = (Normal(new Use(phi.Sources[a], width), fast, 0), Normal(new Use(phi.Sources[b], width), taken, 0));
-                    // 生成代码在守卫里只做初始化，不给局部赋值：这种 φ 只能来自 clang 的部分冗余消除，
-                    // 快路径复用已有的值（不是读取），初始化可能改写内存的一臂重新读取。保留的正是重新读取的一臂。
-                    // 两臂都是读取而位置不同时不成立。初始化调用破坏的寄存器不会再被真正读取，这一臂的值没有意义。
-                    static bool Reads(Expr value) => ExprMap.Walk(value).Any(e => e is Load);
-                    if (Plain(skipped) != Plain(initialized) && (Reads(skipped) || !Reads(initialized)) && initialized is not Use { Variable.Version: -1 })
-                    { reason = "两臂的合流值不同"; return false; }
+                    // 缓存值与慢路径重读只有在来源和观察区间都一致时才可合并；部分冗余消除的外形不是等价证明。
+                    if (Plain(skipped) != Plain(initialized))
+                    { reason = $"两臂的合流值不同：{phi.Target}，快路径 {Plain(skipped)}，初始化路径 {Plain(initialized)}"; return false; }
                 }
                 reason = "";
                 return true;
@@ -174,6 +173,13 @@ internal static class OnceGuardsPass
                 // 没有异常边只说明块里没有原生抛出点，不说明它在 try 外：只有两处都有异常边且去向不同才算跨区域。
                 if (!visited.Add(current) || current.IsLandingPad || current.Handler is not null && head.Handler is not null && current.Handler != head.Handler)
                 { reason = "路径含异常边或环"; return false; }
+                if (initializing && guard.Kind == Kind.Metadata)
+                    // 类型与调用求解会复制分析图；同一起始地址保留原块的初始化证据。
+                    foreach (var proof in state.Result.MetadataInitializations.Where(p => p.Block.Start == current.Start))
+                    {
+                        line.Initialized = true;
+                        line.Slots.Add(proof.Slot);
+                    }
                 line.Previous = previous;
                 var incoming = current.Predecessors.IndexOf(previous);
                 var shared = current.Predecessors.Count > 1;
@@ -248,8 +254,11 @@ internal static class OnceGuardsPass
             {
                 case Kind.Metadata:
                     if (helper != HelperKind.InitMetadata || call.Arguments.FirstOrDefault() is not { } slot || Normal(slot, line, 0) is not Const address
-                        || state.facts.Usages.At(address.Value) is null) return false;
+                        || state.facts.Usages.At(address.Value) is not { } usage) return false;
                     line.Slots.Add(address.Value);
+                    // 初始化入口返回同一槽位的实体；慢路径复用返回寄存器，快路径直接读取槽位。
+                    if (call.Defines is [{ Width: 64 } returned])
+                        line.Values[returned] = new Symbol(SymbolOfPass.SymbolOf(usage.Usage.Kind), usage.Usage.Value);
                     return true;
                 case Kind.ClassConstructor:
                     return call.Op is { Kind: OpKind.RunClassConstructor } op ? Equals(op.Operand, guard.Type) : helper == HelperKind.ClassInit && Class(call, line);
@@ -285,7 +294,10 @@ internal static class OnceGuardsPass
                         }
                     case Load load:
                         if (line.Stores.Count > 0) loadAfterStore = true;
-                        return Content(new Load(Normal(load.Address, line, depth + 1), load.Width), line, depth + 1);
+                        var address = Normal(load.Address, line, depth + 1);
+                        if (load.Width == 64 && address is Const slot && state.facts.Usages.At(slot.Value) is { } usage)
+                            return new Symbol(SymbolOfPass.SymbolOf(usage.Usage.Kind), usage.Usage.Value);
+                        return Content(new Load(address, load.Width), line, depth + 1);
                     default:
                         return null;
                 }
@@ -369,10 +381,18 @@ internal static class OnceGuardsPass
         }
 
         private bool KeepsMemory(Call call) => call.Op is { } op ? RuntimeOps.Of(op.Kind)?.Behavior.InvalidatesMemory == false
-            : state.owner.HelperOf(call)?.Kind is HelperKind.InitMetadata or HelperKind.InitializedTypeInfo;
+            : state.owner.HelperOf(call)?.Kind is HelperKind.InitMetadata or HelperKind.InitializedTypeInfo
+                || call is { Kind: CallKind.Direct, Target: Const target } && state.facts.NativeCalls.At(target.Value) is { WritesMemory: false };
 
         private bool Disjoint(Expr written, ulong at, ulong size, Expr root, ulong offset, ulong bytes)
         {
+            if (written is FrameAddress saved && root is FrameAddress loaded)
+            {
+                // FrameAddress 自带帧偏移；保存非易失寄存器不应阻断其他栈槽的来源证明。
+                var begin = (Int128)saved.Offset + unchecked((long)at);
+                var read = (Int128)loaded.Offset + unchecked((long)offset);
+                return begin + size <= read || read + bytes <= begin;
+            }
             var separate = offset + bytes <= at || at + size <= offset;
             if (written == root) return separate;
             // 栈与元数据不是对象字段；托管引用只指向对象起点，不同偏移的字段不重叠。

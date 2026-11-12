@@ -34,6 +34,8 @@ public sealed record MachineValue(int Index, TypeRef Type, Transfer Transfer, Ab
 /// <summary>托管方法的完整机器签名：寄存器与栈上的实参、返回值、隐藏的 MethodInfo，以及经指针实参的内存效果。</summary>
 public sealed record MachineSignature(MachineValue[] Arguments, MachineValue? Return, AbiPiece? MethodInfo, int StackSize)
 {
+    /// <summary>正常返回时包含传入结果缓冲区地址的寄存器。</summary>
+    public Storage? BufferPointerResult { get; init; }
     public const int ReturnIndex = int.MaxValue;
     /// <summary>隐藏的 MethodInfo 实参在内存效果中的值编号。</summary>
     public const int MethodInfoIndex = int.MinValue;
@@ -47,7 +49,7 @@ public sealed record MachineSignature(MachineValue[] Arguments, MachineValue? Re
 
 public sealed partial class ManagedAbi
 {
-    /// <summary>已拆包的 invoker：引用按值，值参数按地址，非 void 返回值写入最后一个存储。</summary>
+    /// <summary>已拆包的 invoker 使用逻辑参数编号；引用按值，值参数按地址，非 void 返回值写入最后一个存储。不是物理调用约定。</summary>
     public MachineSignature Invoker(MethodRef method)
     {
         var arguments = new List<MachineValue>();
@@ -88,6 +90,7 @@ public sealed partial class ManagedAbi
     /// <summary>方法的机器签名；无法分类时返回 null 并给出原因。</summary>
     public MachineSignature? Machine(MethodRef method, out string? problem)
     {
+        if (architecture == Architecture.X64) return MachineWin64(method, out problem);
         if (Classify(method, out problem) is not { } signature) return null;
         var stack = StackArguments(signature);
         var arguments = new List<MachineValue>();

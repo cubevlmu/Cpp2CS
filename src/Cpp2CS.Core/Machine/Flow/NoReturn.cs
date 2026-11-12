@@ -12,7 +12,7 @@ namespace Cpp2CS.Machine.Flow;
 /// 路径搜索先走不经过调用的边，只在需要时才递归判定路径上的被调用者，所以只触及少量函数。
 /// 无法判断的情形（寄存器跳转、顺序执行越界、递归、深度超限）一律按“会返回”处理。
 /// </summary>
-public sealed class NoReturnOracle(IMachine machine, CodeMap functions)
+public sealed partial class NoReturnOracle(IMachine machine, CodeMap functions)
 {
     private const int MaxDepth = 64;
     private readonly Dictionary<ulong, bool> known = new();
@@ -72,6 +72,7 @@ public sealed class NoReturnOracle(IMachine machine, CodeMap functions)
 
     internal bool Returns(ulong entry, CodeFunction range)
     {
+        if (machine.Architecture == Architecture.X64) return ReturnsX64(entry, range);
         bool InRange(ulong a) => range.Contains(a);
         ulong? PadAt(ulong a)
         {
