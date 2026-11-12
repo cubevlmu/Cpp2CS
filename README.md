@@ -1,10 +1,12 @@
 # Cpp2CS
 
-> **重写中。** 上一版保存在 [`attempt-11`](../../tree/attempt-11) 分支：二进制 → 机器 IR → 恢复的分层是合理的，但恢复层没有为帧内存、值的位来源、φ 合流和类型建立统一模型，只能针对 clang 优化后的每种形态补规则，规则分散且相互耦合。本分支以这些底层模型为核心重写恢复层，设计见 [架构](docs/架构.md)。
+> **实验性实现，保留当前成果。** Windows x64 后端尚未与 ARM64 达到同等级，当前不继续承诺补齐或修复时限。使用前请阅读[文档索引](docs/README.md)和[已知局限](docs/LIMITATIONS.md)。
 
 Cpp2CS 从 Unity IL2CPP 二进制与匹配的元数据中恢复托管方法，输出 CIL 程序集、C# 源码和未恢复部分的诊断。
 
 恢复管线面向 Android ARM64 ELF，运行时布局按 Unity 2022.3.62f2、元数据 v31 建模。映像读取能力不代表其他平台或版本已完成恢复适配。
+
+Windows x64 PE 提供独立的 [SLEIGH 后端](docs/WIN64_BACKEND.md)，复用公共恢复与输出组件；运行时辅助函数、Windows 异常、共享泛型与 L2 规则衔接仍有明确缺口。匿名本地全量样本中完整写出为 90.95%，写出且通过托管静态检查为 90.48%；这些数字不是语义正确率，统计口径见[验证记录](docs/VALIDATION.md)。
 
 ## 构建
 
@@ -48,4 +50,4 @@ dotnet run --project src/Cpp2CS.Cli -c Release -- recover <binary> <metadata> <o
 
 部分方法可以输出可读片段，并以 `Cpp2CS.Unrecovered` 和原生地址标记缺口；完整原因见 `recovery.jsonl`，不嵌入程序集字符串堆。这些方法不计入完整写出清单。源码折叠和类型名称还原不等于整个工程可以编译或在 Unity 中运行。
 
-实现边界见 [架构](docs/架构.md)。
+实现边界见[已知局限](docs/LIMITATIONS.md)，ARM64 与 Win64 的规则入口差异见[L2 对照](docs/L2_PARITY.md)。旧设计文档已由当前能力和限制说明替换。

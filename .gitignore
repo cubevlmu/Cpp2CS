@@ -1,6 +1,7 @@
 **/bin/
 **/obj/
 artifacts/
+/ref/
 *.user
 *.suo
 .vs/
